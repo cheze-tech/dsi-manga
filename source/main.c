@@ -23,6 +23,8 @@ typedef struct { FILE *f; uint32_t left; Img *img; } Dec;
 
 static u16 *scr[2];         // [0] top, [1] bottom, 256 px stride
 static int gap = 40;        // pixels hidden by the hinge (D-pad up/down when not zoomed)
+#define INVMAX 64
+static u16 invtab[INVMAX + 1];   // 16.16 reciprocal for the box-average divisions
 
 static void gfx_init(void) {
     videoSetMode(MODE_5_2D);
@@ -33,7 +35,11 @@ static void gfx_init(void) {
 }
 
 static void fill(u16 c) {
-    for (int s = 0; s < 2; s++) for (int i = 0; i < 256 * 192; i++) scr[s][i] = c;
+    u32 pair = c | ((u32)c << 16);
+    for (int s = 0; s < 2; s++) {
+        u32 *p = (u32 *)scr[s];
+        for (int i = 0; i < 256 * 96; i++) p[i] = pair;
+    }
 }
 
 // ---- JPEG decode (TJpgDec reads straight from the PDF file) ----------------
@@ -66,14 +72,15 @@ static int jout(JDEC *jd, void *bm, JRECT *r) {
 }
 
 // decode page to RGB565, shrunk by 1/2/4/8 so it is still >= want_w wide
+static u8 jpool[8192];      // TJpgDec work pool (one decode at a time)
+
 static int decode(Pdf *pdf, int page, int want_w, Img *im) {
     free(im->px); im->px = NULL;
     Dec d = { pdf->f, pdf->pages[page].len, im };
     fseek(pdf->f, pdf->pages[page].off, SEEK_SET);
     JDEC jd;
-    void *pool = malloc(8192);
     int rc = -1;
-    if (pool && jd_prepare(&jd, jin, pool, 8192, &d) == JDR_OK) {
+    if (jd_prepare(&jd, jin, jpool, sizeof jpool, &d) == JDR_OK) {
         int s = 0;
         while (s < 3 && (jd.width >> (s + 1)) >= want_w) s++;
         for (;; s++) {                                  // low on RAM? shrink more
@@ -85,7 +92,6 @@ static int decode(Pdf *pdf, int page, int want_w, Img *im) {
         if (im->px && jd_decomp(&jd, jout, s) == JDR_OK) rc = 0;
         else { free(im->px); im->px = NULL; }
     }
-    free(pool);
     return rc;
 }
 
@@ -93,37 +99,74 @@ static int decode(Pdf *pdf, int page, int want_w, Img *im) {
 // The page is virtually vw pixels wide; the screens show a 256x384 window
 // at (ox,oy) of it. Each screen pixel is a box average of source pixels.
 
+// RGB565 (decoder) -> RGB555 (screen)
+static inline u16 c565(u16 s) {
+    return (u16)((s >> 11) | (((s >> 6) & 31) << 5) | ((s & 31) << 10) | BIT(15));
+}
+
+static inline int recip(int n) { return n <= INVMAX ? invtab[n] : 65536 / n; }
+
+static void fill_row(u16 *row, int w, u16 c) {
+    u32 pair = c | ((u32)c << 16);
+    int i = 0;
+    for (; i + 1 < w; i += 2) *(u32 *)(row + i) = pair;
+    if (i < w) row[i] = c;
+}
+
+// The page fits 256 x (384+gap); every screen pixel is a box average of source pixels.
+// 1:1 pixels are copied directly and the rest use a reciprocal instead of a division.
 static void render(const Img *im, int vw, int ox, int oy) {
     int WH = 384 + gap;                          // window height; `gap` rows fall under the hinge
     int vh = (int)((long long)im->h * vw / im->w);
-    int xa[256], xb[256];
+    int xa[256], xb[256], nx[256];
     for (int sx = 0; sx < 256; sx++) {
         int vx = ox + sx;
         if (vx < 0 || vx >= vw) { xa[sx] = -1; continue; }
-        xa[sx] = vx * im->w / vw;
-        xb[sx] = (vx + 1) * im->w / vw;
-        if (xb[sx] <= xa[sx]) xb[sx] = xa[sx] + 1;
+        int a = vx * im->w / vw;
+        int b = (vx + 1) * im->w / vw;
+        if (b <= a) b = a + 1;
+        xa[sx] = a; xb[sx] = b; nx[sx] = b - a;
     }
     for (int sy = 0; sy < WH; sy++) {
         if (sy >= 192 && sy < 192 + gap) continue;
         int dy = sy < 192 ? sy : sy - gap;
         u16 *row = scr[dy >= 192] + (dy % 192) * 256;
         int vy = oy + sy;
-        if (vy < 0 || vy >= vh) { for (int i = 0; i < 256; i++) row[i] = BIT(15); continue; }
+        if (vy < 0 || vy >= vh) { fill_row(row, 256, BIT(15)); continue; }
         int y0 = vy * im->h / vh, y1 = (vy + 1) * im->h / vh;
         if (y1 <= y0) y1 = y0 + 1;
+        int ny = y1 - y0;
         for (int sx = 0; sx < 256; sx++) {
-            if (xa[sx] < 0) { row[sx] = BIT(15); continue; }
-            int r = 0, g = 0, b = 0, n = 0;
-            for (int y = y0; y < y1; y++) {
-                const u16 *p = im->px + y * im->w;
-                for (int x = xa[sx]; x < xb[sx]; x++, n++) {
+            int x0 = xa[sx];
+            if (x0 < 0) { row[sx] = BIT(15); continue; }
+            int n = nx[sx] * ny;
+            if (n == 1) { row[sx] = c565(im->px[y0 * im->w + x0]); continue; }
+            int r = 0, g = 0, b = 0;
+            const u16 *p = im->px + y0 * im->w;
+            for (int y = y0; y < y1; y++, p += im->w)
+                for (int x = x0; x < xb[sx]; x++) {
                     u16 c = p[x];
                     r += c >> 11; g += (c >> 5) & 63; b += c & 31;
                 }
-            }
-            row[sx] = RGB15(r / n, (g / n) >> 1, b / n) | BIT(15);
+            int inv = recip(n);
+            r = (int)(((u32)r * (u32)inv) >> 16);
+            g = (int)(((u32)g * (u32)inv) >> 17);
+            b = (int)(((u32)b * (u32)inv) >> 16);
+            row[sx] = RGB15(r, g, b) | BIT(15);
         }
+    }
+}
+
+// Green progress line along the bottom edge of the lower screen.
+static void progress_line(int page, int n) {
+    if (!scr[1] || n <= 0 || page < 0) return;
+    int w = (int)((long long)(page + 1) * 256 / n);
+    if (w < 1) w = 1;
+    if (w > 256) w = 256;
+    u16 bg = RGB15(2, 2, 2) | BIT(15), fg = RGB15(3, 28, 5) | BIT(15);
+    for (int y = 189; y < 192; y++) {
+        u16 *row = scr[1] + y * 256;
+        for (int x = 0; x < 256; x++) row[x] = x < w ? fg : bg;
     }
 }
 
@@ -168,7 +211,7 @@ static void read_book(const char *path) {
     }
     gfx_init();
     Img im = { 0 };
-    int page = bm_load(path), zoom = 0, rtl = 1;
+    int page = bm_load(path), zoom = 0, rtl = 1, turns = 0;
     int vw = 256, ox = 0, oy = 0, reload = 1, dirty = 0, tx = -1, ty = -1, refit = 0;
     if (page < 0 || page >= pdf.npages) page = 0;
     touchPosition tp;
@@ -195,12 +238,14 @@ static void read_book(const char *path) {
         }
         if (dn & KEY_X) { zoom ^= 1; reload = 1; }
         if (step && page + step >= 0 && page + step < pdf.npages) {
-            page += step; reload = 1; bm_save(path, page);
+            page += step; reload = 1;
+            if (++turns % 10 == 0) bm_save(path, page);   // don't touch the SD card every turn
         }
 
         if (reload) {
             reload = 0;
-            if (decode(&pdf, page, zoom ? 600 : 384, &im) < 0) { fill(RGB15(20, 0, 0) | BIT(15)); continue; }
+            // Native-resolution decode: the DS screens can't show more detail than this.
+            if (decode(&pdf, page, zoom ? 480 : 240, &im) < 0) { fill(RGB15(20, 0, 0) | BIT(15)); continue; }
             if (zoom) { vw = 512; ox = rtl ? vw - 256 : 0; oy = 0; }
             else fit_view(&im, &vw, &ox, &oy);
             dirty = 1;
@@ -229,7 +274,7 @@ static void read_book(const char *path) {
             if (oy > my) oy = my;
             if (ox != px || oy != py) dirty = 1;
         }
-        if (dirty) { render(&im, vw, ox, oy); dirty = 0; }
+        if (dirty) { render(&im, vw, ox, oy); progress_line(page, pdf.npages); dirty = 0; }
     }
     bm_save(path, page);
     free(im.px);
@@ -259,6 +304,8 @@ int main(void) {
         iprintf("SD card / FAT init failed.\n");
         for (;;) swiWaitForVBlank();
     }
+    invtab[0] = 0;
+    for (int i = 1; i <= INVMAX; i++) invtab[i] = (u16)((65536 + i - 1) / i);
     for (;;) {
         char *names[256];
         const char *dir = "/manga/";

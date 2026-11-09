@@ -11,7 +11,8 @@ NDSTOOL   := $(DEVKITPRO)/tools/bin/ndstool
 SPECS     ?= ds_arm9.specs
 # DSi-mode header flags: from memory of other DSi-mode homebrew Makefiles, UNVERIFIED.
 DSIFLAGS  ?= -u 00030004 -z 80040407
-ARCH      := -march=armv5te -mtune=arm946e-s -mthumb -mthumb-interwork
+# ARM mode (not Thumb) is noticeably faster for the pixel and JPEG loops on ARM9.
+ARCH      := -march=armv5te -mtune=arm946e-s -marm -mthumb-interwork
 CFLAGS    := -O2 -Wall $(ARCH) -ffunction-sections -fdata-sections -DARM9 -D__NDS__ -I$(LIBNDS)/include -I$(DEVKITPRO)/calico/include -Isource
 LDFLAGS   := -specs=$(DEVKITPRO)/calico/share/ds9.specs -g $(ARCH) -Wl,--gc-sections -L$(LIBNDS)/lib -L$(DEVKITPRO)/calico/lib
 COMMON    := source/pdf.c source/tjpgd.c

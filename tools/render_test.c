@@ -36,6 +36,7 @@ static int check_jout(void) {   // decoder output -> cache pixel must agree for 
     return bad;
 }
 int main(void) {
+    tables_init();
     scr[0] = calloc(256 * 256, 2); scr[1] = calloc(256 * 256, 2);
     printf("jout (JD_FORMAT=%d) mismatches: %d\n", JD_FORMAT, check_jout());
     for (int i = 0; i < NSLOT; i++) cache[i].page = -1;

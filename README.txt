@@ -2,11 +2,12 @@ DSi PDF / manga reader  -  two editions
 =======================================
 STANDARD  (source/main.c)      works in plain DS mode, one page decoded at a time.
 ENHANCED  (source/enhanced.c)  for DSi mode / 16 MB RAM:
-  * page cache: previous + current + next page kept decoded (dual view keeps 4),
-    next page is decoded in the background while you read; a button press aborts it
-  * higher quality: decodes at up to ~1100 px wide (X in library = normal/high),
-    grayscale pages are stored at 1 byte/pixel so they get twice the detail per MB,
-    zoom 1x-4x
+  * page cache: books under 5 MB keep 5 pages decoded (current, 2 back, 2 ahead);
+    larger books keep 3. Next pages are decoded in the background while you read;
+    a button press aborts it. The library shows the heap size, page-slot budget and
+    the peak cache RAM used by the last book.
+  * higher quality: decodes at roughly twice the screen width (X in library =
+    normal/high), grayscale pages are stored at 1 byte/pixel, zoom 1x-4x
   * views (SELECT): PORTRAIT page over both screens -> SPREAD (one wide page over both
     screens) -> DUAL (two pages, one per screen). SPREAD and DUAL are for holding the
     console sideways like a book; Y in the library picks which way you turn it.
@@ -17,13 +18,15 @@ ENHANCED  (source/enhanced.c)  for DSi mode / 16 MB RAM:
 BUILD
   1. Install devkitPro (devkitARM, libnds, libfat).
   2. Download TJpgDec (elm-chan.org/fsw/tjpgd/00index.html), copy tjpgd.c, tjpgd.h,
-     tjpgdcnf.h into source/.  In tjpgdcnf.h:  JD_FORMAT 1   JD_USE_SCALE 1   JD_TBLCLIP 1
+     tjpgdcnf.h into source/.  In tjpgdcnf.h:  JD_USE_SCALE 1   JD_TBLCLIP 1
+     JD_FASTDECODE 1  (the 32-bit ARM9 path; JD_FORMAT 0 or 1 both work).
      (enhanced.c reads jd.ncomp from the JDEC struct to detect grayscale JPEGs.)
   3. make        -> dsimanga.nds        make dsi  -> dsimanga_dsi.nds
   Put the .nds on the SD card, PDFs in /manga.
 
 IS IT REALLY USING 16 MB?
-  The library screen prints "DSi 12MB" (largest block it could allocate). If it says
+  The library screen prints "DSi 12MB" (largest block it could allocate) plus the
+  KB budget per cached page and the peak cache RAM of the last book. If it says
   "DS 3MB" the app is running in DS mode or libnds gave it the small heap. Things to try:
   the DSIFLAGS in the Makefile, TWiLight Menu++'s per-app "run in DSi mode" setting,
   or a different linker spec (make dsi SPECS=...). The app still works either way - it
@@ -34,6 +37,7 @@ CONTROLS
   Reader:  A/R next, B/L prev, D-pad left/right turn (dual: single page shift),
            Y reading direction (starts right-to-left), X zoom 1x-4x, SELECT view,
            zoomed: D-pad / touch-drag pan, START back to library
+           Green line along the bottom of the lower screen = reading progress
   Red square top-right = decoding. Red screen = page can't be decoded (progressive JPEG etc).
 
 HOST TESTS (no DSi needed)

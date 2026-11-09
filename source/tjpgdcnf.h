@@ -24,10 +24,9 @@
 /  1: Enable
 */
 
-#define JD_FASTDECODE	0
+#define JD_FASTDECODE	1
 /* Optimization level
 /  0: Basic optimization. Suitable for 8/16-bit MCUs.
 /  1: + 32-bit barrel shifter. Suitable for 32-bit MCUs.
 /  2: + Table conversion for huffman decoding (wants 6 << HUFF_BIT bytes of RAM)
 */
-

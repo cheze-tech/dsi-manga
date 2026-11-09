@@ -10,3 +10,5 @@ void vramSetPrimaryBanks(int a,int b,int c,int d){} void vramSetBankA(int a){}
 int bgInit(int a,int b,int c,int d,int e){return 0;} int bgInitSub(int a,int b,int c,int d,int e){return 1;} u16 *bgGetGfxPtr(int i){return 0;}
 int isDSiMode(void){return 1;}
 void consoleInit(PrintConsole*a,int b,int c,int d,int e,int f,int g,int h){} void consoleSelect(PrintConsole*a){} void vramSetBankC(int a){}
+void audio_init(void){} void audio_pump(int n){(void)n;} void audio_next(void){} void audio_toggle(void){}
+int audio_paused(void){return 0;} const char *audio_title(void){return 0;}
