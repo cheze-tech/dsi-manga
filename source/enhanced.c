@@ -64,7 +64,6 @@ static size_t g_cachebytes, g_cachepeak, g_lastpeak;
 static int g_lastpages;
 static u16 invtab[INVMAX + 1];   // 16.16 reciprocal for 1..INVMAX
 static u8 g_pool[8192];          // TJpgDec work pool (one decode runs at a time)
-static u32 g_pend;          // key presses seen while a background decode was running
 static Slot cache[NSLOT];
 static int g_curpage = -1;   // displayed page: never evicted by prefetch
 static int g_curpage2 = -1;  // second displayed page in DUAL view
@@ -158,9 +157,13 @@ static int jout(JDEC *jd, void *bm, JRECT *r) {
     if ((++d->tick & 63) == 0) {             // not on every block: keeps long decodes cheap
         audio_pump(1);
         if (d->abortable) {                  // background decode: give way to the buttons
-            scanKeys();
-            g_pend |= keysDown();
-            if (g_pend || keysHeld()) return 0;
+            // Do NOT scan here. Scanning mid-frame consumes the press edge and
+            // forces the loop to replay it later, mixing two snapshots taken at
+            // different times into one key mask. The loop scans exactly once per
+            // frame; a press during this chunk is still in the key register and
+            // shows up there. keysHeld() is the last frame's scan, which is all
+            // this abort needs.
+            if (keysHeld()) return 0;
         }
     }
     Img *im = d->img;
@@ -435,9 +438,14 @@ static int up_step(int fast) {
     // Grayscale JPEGs use 8x8 MCUs; scale the budget by MCU area so a chunk
     // costs about the same on grayscale and colour pages.
     unsigned int blocks = (unsigned int)g_up.jd.msx * g_up.jd.msy;
-    unsigned int pixels = fast ? UP_PIXELS * 2 : UP_PIXELS;
-    unsigned int mc = blocks ? pixels / (blocks * 64u) : 192u;
-    if (mc < 32) mc = 32;
+    // A fixed slice per frame. The old pixels/blocks formula floored at 32 MCUs
+    // for every normal page, so an idle frame and a busy one advanced at the
+    // same slow rate. 96 MCUs is about 24k pixels of 4:2:0 JPEG (6k of
+    // grayscale), which still fits one idle frame and keeps the 64-block abort
+    // check inside each chunk.
+    unsigned int mc = fast ? 96u : 48u;
+    if (mc > blocks) mc = blocks;
+    if (!mc) mc = 1;
     JRESULT r = jd_decomp_step(&g_up.jd, jout, mc);
     if (r == JDR_MORE) return 0;
     if (r != JDR_OK) { up_cancel(); return 0; }
@@ -485,31 +493,34 @@ static inline int recip(int n) {
 // Box average of [x0,x1) x [y0,y1); n = (x1-x0)*(y1-y0) is passed in because
 // the caller already knows it. The 1:1 path and fixed-point reciprocal replace
 // the per-pixel divisions, which were the slowest part of drawing.
-static inline u16 box_px(const Img *im, int x0, int x1, int y0, int y1, int n) {
+static inline u16 box_gray(const u8 *px, int w, int x0, int x1, int y0, int y1, int n) {
     if (n == 1) {
-        if (im->gray) {
-            int v = ((const u8 *)im->px)[y0 * im->w + x0] >> 1;
-            return RGB15(v, v, v) | BIT(15);
-        }
-        return c565(((const u16 *)im->px)[y0 * im->w + x0]);
-    }
-    int inv = recip(n);
-    if (im->gray) {
-        int sum = 0;
-        const u8 *p = (const u8 *)im->px + y0 * im->w;
-        for (int y = y0; y < y1; y++, p += im->w)
-            for (int x = x0; x < x1; x++) sum += p[x];
-        int v = (int)(((u32)sum * (u32)inv) >> 17);       // /n, then /2 for 5-bit gray
+        int v = px[y0 * w + x0] >> 1;
         return RGB15(v, v, v) | BIT(15);
     }
-    int r = 0, g = 0, b = 0;
-    const u16 *p = (const u16 *)im->px + y0 * im->w;
-    for (int y = y0; y < y1; y++, p += im->w)
+    int inv = recip(n), sum = 0;
+    const u8 *p = px + y0 * w;
+    for (int y = y0; y < y1; y++, p += w)
+        for (int x = x0; x < x1; x++) sum += p[x];
+    int v = (int)(((u32)sum * (u32)inv) >> 17);           // /n, then /2 for 5-bit gray
+    return RGB15(v, v, v) | BIT(15);
+}
+
+static inline u16 box_col(const u16 *px, int w, int x0, int x1, int y0, int y1, int n) {
+    if (n == 1) return c565(px[y0 * w + x0]);
+    int inv = recip(n), r = 0, g = 0, b = 0;
+    const u16 *p = px + y0 * w;
+    for (int y = y0; y < y1; y++, p += w)
         for (int x = x0; x < x1; x++) { u16 c = p[x]; r += c >> 11; g += (c >> 5) & 63; b += c & 31; }
     r = (int)(((u32)r * (u32)inv) >> 16);
     g = (int)(((u32)g * (u32)inv) >> 17);
     b = (int)(((u32)b * (u32)inv) >> 16);
     return RGB15(r, g, b) | BIT(15);
+}
+
+static inline u16 box_px(const Img *im, int x0, int x1, int y0, int y1, int n) {
+    return im->gray ? box_gray((const u8 *)im->px, im->w, x0, x1, y0, y1, n)
+                    : box_col((const u16 *)im->px, im->w, x0, x1, y0, y1, n);
 }
 
 static void geom(const Img *im, int W, int H, int f, int *vw, int *vh) {
@@ -534,10 +545,11 @@ static void blit(const Img *im, int RU, int RV, int W, int H, int f, int ox, int
     geom(im, W, H, f, &vw, &vh);
     for (int u = 0; u < W; u++) {
         int vx = ox + u;
-        if (vx < 0 || vx >= vw) { xa[u] = -1; continue; }
+        if (vx < 0 || vx >= vw) { xa[u] = xb[u] = 0; nx[u] = 0; continue; }   // 0: outside the picture
         int a = vx * im->w / vw;
         int b = (vx + 1) * im->w / vw;
         if (b <= a) b = a + 1;
+        if (b > im->w) b = im->w;
         xa[u] = a; xb[u] = b; nx[u] = b - a;
     }
     int rot = g_buf ? 0 : g_rot;
@@ -566,12 +578,48 @@ static void blit(const Img *im, int RU, int RV, int W, int H, int f, int ox, int
             if (y1 <= y0) y1 = y0 + 1;
             ny = y1 - y0;
         }
-        for (int u = 0; u < W; u++) {
-            u16 *dst;
-            if (row) dst = row + u;            // portrait: contiguous row write
-            else { if (!dstcol[u]) continue; dst = dstcol[u] + (rot == 1 ? 255 - (RV + v) : RV + v); }
-            if (blank || xa[u] < 0) { *dst = BIT(15); continue; }
-            *dst = box_px(im, xa[u], xb[u], y0, y1, nx[u] * ny);
+        // Two specialized loops: portrait/thumbnail rows are contiguous, book
+        // views are strided per column. Keeping the branch out of the pixel
+        // loop and picking gray/colour once per row was costing a compare and
+        // a format test on every one of ~100k pixels per redraw.
+        if (row) {
+            if (blank) { for (int u = 0; u < W; u++) row[u] = BIT(15); continue; }
+            if (im->gray) {
+                const u8 *px = (const u8 *)im->px;
+                for (int u = 0; u < W; u++) {
+                    int n = nx[u] * ny;
+                    row[u] = n ? box_gray(px, im->w, xa[u], xb[u], y0, y1, n) : BIT(15);
+                }
+            } else {
+                const u16 *px = (const u16 *)im->px;
+                for (int u = 0; u < W; u++) {
+                    int n = nx[u] * ny;
+                    row[u] = n ? box_col(px, im->w, xa[u], xb[u], y0, y1, n) : BIT(15);
+                }
+            }
+        } else {
+            int pos = rot == 1 ? 255 - (RV + v) : RV + v;
+            if (blank) {
+                for (int u = 0; u < W; u++) if (dstcol[u]) dstcol[u][pos] = BIT(15);
+                continue;
+            }
+            if (im->gray) {
+                const u8 *px = (const u8 *)im->px;
+                for (int u = 0; u < W; u++) {
+                    u16 *d = dstcol[u];
+                    if (!d) continue;
+                    int n = nx[u] * ny;
+                    d[pos] = n ? box_gray(px, im->w, xa[u], xb[u], y0, y1, n) : BIT(15);
+                }
+            } else {
+                const u16 *px = (const u16 *)im->px;
+                for (int u = 0; u < W; u++) {
+                    u16 *d = dstcol[u];
+                    if (!d) continue;
+                    int n = nx[u] * ny;
+                    d[pos] = n ? box_col(px, im->w, xa[u], xb[u], y0, y1, n) : BIT(15);
+                }
+            }
         }
     }
 }
@@ -1007,12 +1055,19 @@ static void vkeys(int view, u32 *l, u32 *r, u32 *u, u32 *d) {
 
 // One directional decision for both page turns and tests. Viewer-left means
 // "next" when reading right-to-left; dual-page view advances by a spread.
+// Only newly pressed keys are considered (edges, never held state), and a
+// snapshot holding both opposing directions is ambiguous, so it is ignored
+// rather than resolved by whichever check runs last -- that last-wins rule is
+// what let a quick LEFT/RIGHT flick turn backwards when the two bits ended up
+// in the same mask.
 static int dpad_step(int view, int rtl, u32 dn) {
     u32 l, r, u, d;
     vkeys(view, &l, &r, &u, &d);
+    u32 nxt = dn & (rtl ? l : r), prv = dn & (rtl ? r : l);
     int step = 0;
-    if (dn & (rtl ? l : r)) step = 1;
-    if (dn & (rtl ? r : l)) step = -1;
+    if (nxt && prv) return 0;
+    if (nxt) step = 1;
+    else if (prv) step = -1;
     return is_dual(view) ? step * 2 : step;
 }
 
@@ -1054,6 +1109,7 @@ static void lib_load(void) {
             sscanf(line + 5, "%d %d %d %d", &cfg.quality, &cfg.gap, &cfg.view, &cfg.rtl);
             if (cfg.gap < 0 || cfg.gap > 96) cfg.gap = 40;
             if (cfg.view < 0 || cfg.view >= V_COUNT) cfg.view = 0;
+            cfg.rtl = cfg.rtl ? 1 : 0;      // a corrupt library file must not make the direction arbitrary
             continue;
         }
         long last; int page, np, off = 0;
@@ -1198,8 +1254,7 @@ static void reader(Book *b, const char *path, int start) {
         if (!pm_ok()) break;
         swiWaitForVBlank();
         scanKeys();
-        u32 dn = keysDown() | g_pend, hd = keysHeld(), kl, kr, ku, kd;
-        g_pend = 0;
+        u32 dn = keysDown(), hd = keysHeld(), kl, kr, ku, kd;
         u32 combo = KEY_L | KEY_A | KEY_DOWN;
         u32 overlay = KEY_L | KEY_UP;
 
@@ -1247,6 +1302,11 @@ static void reader(Book *b, const char *path, int start) {
             }
         }
         if (dn & KEY_START) break;
+        // Resolve the page turn before this frame can change the view or the
+        // reading direction: those changes would remap the very key that was
+        // just pressed, so a tap landing on a rotate/RTL frame could be read
+        // as the opposite direction.
+        int nav = f == 1 ? dpad_step(view, rtl, dn) : 0;
         int vd = ((dn & KEY_R) ? 1 : 0) - ((dn & KEY_L) ? 1 : 0);          // R rotate forward, L back
         if (vd) { view = (view + V_COUNT + vd) % V_COUNT; f = 1; oy = 0; ox = rtl ? 1 << 20 : 0; dirty = 1; }
         if (dn & KEY_SELECT) audio_next();
@@ -1259,8 +1319,7 @@ static void reader(Book *b, const char *path, int start) {
         if (dn & KEY_A) step = dual ? 2 : 1;
         if (dn & KEY_B) step = dual ? -2 : -1;
         if (dual || f == 1) {
-            int ds = dpad_step(view, rtl, dn);
-            if (ds) step = ds;
+            if (nav) step = nav;
             if (dn & (ku | kd)) {                              // hinge gap: up = more, down = less
                 cfg.gap += (dn & ku) ? 4 : -4;
                 if (cfg.gap < 0) cfg.gap = 0;
