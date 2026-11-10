@@ -74,6 +74,28 @@ static Book bk[MAXBOOKS];   // the library
 static int nbook;
 static int g_quit;
 
+// ---- optional on-device profiler -------------------------------------------
+// Build with `make dsi PROFILE=1` for on-screen timings of the load pipeline:
+// book open, SD reads, JPEG decode, background refinement and rendering.
+// Without MANGA_PROFILE every macro below compiles to nothing, so the normal
+// build has no timer reads, counters or overlay drawing at all.
+#ifdef MANGA_PROFILE
+enum { P_OPEN, P_READ, P_DECODE, P_REFINE, P_DRAW, P_COUNT };
+static u64 prof_ticks[P_COUNT];
+static int prof_started;
+static inline u32 prof_now(void) {
+    if (!prof_started) { prof_started = 1; cpuStartTiming(0); }
+    return cpuGetTiming();
+}
+static inline void prof_add(int k, u32 t0) { prof_ticks[k] += (u32)(cpuGetTiming() - t0); }
+static u32 prof_ms(int k) { return (u32)((prof_ticks[k] * 1000) / BUS_CLOCK); }
+#define PROF_T() prof_now()
+#define PROF_ADD(k, t0) prof_add((k), (t0))
+#else
+#define PROF_T() 0
+#define PROF_ADD(k, t0) ((void)(t0))
+#endif
+
 // Calico handles the lid switch and DSi power button through pmMainLoop().
 // Returning false means the app should exit; keeping this flag lets nested
 // reader/menu loops unwind cleanly instead of continuing after a reset request.
@@ -147,7 +169,9 @@ static inline u16 *scrpix(int u, int v) {
 static size_t jin(JDEC *jd, uint8_t *buf, size_t n) {
     Dec *d = jd->device;
     if (n > d->left) n = d->left;
+    u32 _t = PROF_T();
     if (buf) n = fread(buf, 1, n, d->f); else fseek(d->f, n, SEEK_CUR);
+    PROF_ADD(P_READ, _t);
     d->left -= n;
     return n;
 }
@@ -241,7 +265,9 @@ static int decode_into(Pdf *pdf, int pg, Img *im, int abortable, int target,
         s++;                                // fragmented heap: try the next 1/2 step
     }
     if (!im->px) return -1;
+    u32 _t = PROF_T();
     JRESULT r = jd_decomp(&jd, jout, s);
+    PROF_ADD(P_DECODE, _t);
     if (r != JDR_OK) {
         free(im->px); memset(im, 0, sizeof *im);
         return r == JDR_INTR ? -2 : -1;
@@ -437,16 +463,18 @@ static int up_step(int fast) {
     if (!g_up.active) return 0;
     // Grayscale JPEGs use 8x8 MCUs; scale the budget by MCU area so a chunk
     // costs about the same on grayscale and colour pages.
+    // msx/msy are the MCU *size* in 8x8 blocks (1 for grayscale, 2x2 = 4 for
+    // 4:2:0), not the number of MCUs in the image. Dividing the per-frame pixel
+    // budget by the MCU area gives the per-call MCU count (~192 for 4:2:0, ~768
+    // grayscale). Treating msx*msy as an MCU count and clamping the budget to
+    // it slowed refinement by ~96x, which is what made opening and zooming lag.
     unsigned int blocks = (unsigned int)g_up.jd.msx * g_up.jd.msy;
-    // A fixed slice per frame. The old pixels/blocks formula floored at 32 MCUs
-    // for every normal page, so an idle frame and a busy one advanced at the
-    // same slow rate. 96 MCUs is about 24k pixels of 4:2:0 JPEG (6k of
-    // grayscale), which still fits one idle frame and keeps the 64-block abort
-    // check inside each chunk.
-    unsigned int mc = fast ? 96u : 48u;
-    if (mc > blocks) mc = blocks;
-    if (!mc) mc = 1;
+    unsigned int pixels = fast ? UP_PIXELS * 2 : UP_PIXELS;
+    unsigned int mc = blocks ? pixels / (blocks * 64u) : 192u;
+    if (mc < 32) mc = 32;
+    u32 _t = PROF_T();
     JRESULT r = jd_decomp_step(&g_up.jd, jout, mc);
+    PROF_ADD(P_REFINE, _t);
     if (r == JDR_MORE) return 0;
     if (r != JDR_OK) { up_cancel(); return 0; }
 
@@ -641,7 +669,9 @@ static void show(int pg, int RU, int RV, int W, int H, int f, int *ox, int *oy, 
     Img *im = pg >= 0 ? cached(pg) : NULL;
     if (!im) { blank(RU, RV, W, H, (pg >= 0 && bad[pg]) ? (RGB15(20, 0, 0) | BIT(15)) : BIT(15)); return; }
     clamp_pan(im, W, H, f, ox, oy);
+    u32 _t = PROF_T();
     blit(im, RU, RV, W, H, f, *ox, *oy);
+    PROF_ADD(P_DRAW, _t);
 }
 
 static void busy(void) {                      // little red square = decoding
@@ -712,6 +742,21 @@ static void ui_text(u16 *s, int x, int y, const char *t, u16 c, int max) {
         }
     }
 }
+
+#ifdef MANGA_PROFILE
+static unsigned prof_frames;
+static void prof_draw(void) {
+    if (!scr[0]) return;
+    char line[48];
+    ui_rect(scr[0], 0, 60, 168, 40, ui_col(0, 0, 0));
+    snprintf(line, sizeof line, "OPEN %5ums/DEC %5ums", (unsigned)prof_ms(P_OPEN), (unsigned)prof_ms(P_DECODE));
+    ui_text(scr[0], 2, 62, line, ui_col(31, 31, 31), 20);
+    snprintf(line, sizeof line, "READ %5ums/REF %6ums", (unsigned)prof_ms(P_READ), (unsigned)prof_ms(P_REFINE));
+    ui_text(scr[0], 2, 74, line, ui_col(31, 31, 31), 20);
+    snprintf(line, sizeof line, "DRAW %5ums", (unsigned)prof_ms(P_DRAW));
+    ui_text(scr[0], 2, 86, line, ui_col(31, 31, 31), 20);
+}
+#endif
 
 static void ui_fit(char *out, size_t n, const char *s, int max) {
     if (!n) return;
@@ -1213,6 +1258,10 @@ static void draw_library(int sel, const char *dir) {
 
 static void reader(Book *b, const char *path, int start) {
     Pdf pdf;
+#ifdef MANGA_PROFILE
+    u32 _t_open = PROF_T();              // book open -> first page on screen
+    int _first_draw = 1;
+#endif
     int rc = pdf_open(&pdf, path);
     if (rc || !pdf.npages) {
         char d[200] = "";
@@ -1383,6 +1432,9 @@ static void reader(Book *b, const char *path, int start) {
                 load_detail(&pdf, page + 1, bad, base, g_slot, 0, NULL);
             }
             draw_view(view, page, n, rtl, f, &ox, &oy, bad);
+#ifdef MANGA_PROFILE
+            if (_first_draw) { PROF_ADD(P_OPEN, _t_open); _first_draw = 0; }
+#endif
             progress_line(page, n);
             music_dirty = 1;
         }
@@ -1429,6 +1481,9 @@ static void reader(Book *b, const char *path, int start) {
         }
         music_status_check();
         if (music_dirty) { music_status_draw(); music_notice_draw(); music_dirty = 0; }
+#ifdef MANGA_PROFILE
+        if ((++prof_frames & 63) == 0) prof_draw();
+#endif
     }
     cfg.view = view; cfg.rtl = rtl;
     b->page = page;

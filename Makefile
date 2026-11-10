@@ -31,16 +31,27 @@ DSIFLAGS  ?= -u 00030000 -z 80040407
 # ARM mode (not Thumb) is noticeably faster for the pixel and JPEG loops on ARM9.
 ARCH      := -march=armv5te -mtune=arm946e-s -marm -mthumb-interwork
 CFLAGS    := -O2 -Wall $(ARCH) -ffunction-sections -fdata-sections -DARM9 -D__NDS__ -I$(LIBNDS)/include -I$(DEVKITPRO)/calico/include -Isource $(AUDIO_CFLAGS) $(PORTINC)
+# make dsi PROFILE=1 -> on-screen timings for open/read/decode/refine/draw.
+# Off by default: the macros compile to nothing, so the normal build has no
+# timer reads, counters or overlay drawing at all.
+ifeq ($(PROFILE),1)
+CFLAGS += -DMANGA_PROFILE
+endif
 LDFLAGS   := -specs=$(DEVKITPRO)/calico/share/ds9.specs -g $(ARCH) -Wl,--gc-sections -L$(LIBNDS)/lib -L$(DEVKITPRO)/calico/lib $(PORTLIB)
 COMMON    := source/pdf.c source/tjpgd.c
+SRC_DS    := $(COMMON) source/main.c
+SRC_DSI   := $(COMMON) source/enhanced.c source/audio.c source/id3art.c
+# Header changes must relink too; otherwise `make` silently keeps an old ROM
+# (the whole program is compiled in one command, so there are no .o files).
+HDRS      := source/tjpgd.h source/tjpgdcnf.h
 
 all: dsimanga.nds
 dsi: dsimanga_dsi.nds
 
-dsimanga.elf: $(COMMON) source/main.c
-	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lfat -lnds9 -lcalico_ds9 -o $@
-dsimanga_dsi.elf: $(COMMON) source/enhanced.c source/audio.c source/id3art.c
-	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(AUDIO_LIBS) -lfat -lnds9 -lcalico_ds9 -o $@
+dsimanga.elf: $(SRC_DS) $(HDRS)
+	$(CC) $(CFLAGS) $(SRC_DS) $(LDFLAGS) -lfat -lnds9 -lcalico_ds9 -o $@
+dsimanga_dsi.elf: $(SRC_DSI) $(HDRS)
+	$(CC) $(CFLAGS) $(SRC_DSI) $(LDFLAGS) $(AUDIO_LIBS) -lfat -lnds9 -lcalico_ds9 -o $@
 
 ifeq ($(AUDIO),1)
 dsimanga_dsi.elf: | check-audio-deps
