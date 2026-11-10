@@ -66,8 +66,11 @@ static int shuffle_next_avoid(int avoid) {
 static s16 *ring;
 static unsigned rd, wr, cnt;
 static char **names;
+static unsigned char *badmap;       // files that opened but never produced a frame
 static int nnames, ready, paused, cur_rate, stream_open;
 static int cur_track = -1, next_track = -1;
+static int frames_for_track, serial_pending;
+static unsigned track_serial;
 static const char *title;
 static FILE *mp;
 static struct mad_stream ms;
@@ -116,6 +119,8 @@ static int open_track(int i) {
     mad_stream_init(&ms); mad_frame_init(&mf); mad_synth_init(&msy);
     title = names[i];
     cur_track = i;
+    frames_for_track = 0;
+    serial_pending = 1;             // count the track only once a frame decodes
     return 1;
 }
 
@@ -129,6 +134,7 @@ static int open_next(void) {
         next_track = -1;
         if (i < 0) i = audio_shuffle_next();
         if (i < 0) return 0;
+        if (badmap && badmap[i]) continue;   // already known to produce no audio
         if (open_track(i)) {
             plan_next();
             return 1;
@@ -160,6 +166,8 @@ static int decode_frame(void) {
             return 0;
         }
         mad_synth_frame(&msy, &mf);
+        if (serial_pending) { track_serial++; serial_pending = 0; }
+        frames_for_track++;
         int rate = (int)msy.pcm.samplerate, ch = msy.pcm.channels;
         if (rate != cur_rate) open_stream(rate);
         for (unsigned i = 0; i < msy.pcm.length; i++) {
@@ -178,7 +186,10 @@ void audio_pump(int max_frames) {
     if (paused) return;
     while (max_frames-- > 0 && RING - cnt >= 1152) {                    // room for a whole frame
         if (!mp && !open_next()) { ready = 0; return; }                 // nothing playable: give up quietly
-        if (!decode_frame()) close_file();                              // next call starts the next track
+        if (!decode_frame()) {
+            if (cur_track >= 0 && frames_for_track == 0 && badmap) badmap[cur_track] = 1;
+            close_file();                                              // next call starts the next track
+        }
     }
 }
 
@@ -213,6 +224,7 @@ const char *audio_name(int i) { return i >= 0 && i < nnames ? names[i] : NULL; }
 int audio_current_index(void) { return ready ? cur_track : -1; }
 int audio_next_index(void) { return ready && next_track >= 0 ? next_track : -1; }
 const char *audio_next_title(void) { int i = audio_next_index(); return i >= 0 ? names[i] : NULL; }
+unsigned audio_track_serial(void) { return ready ? track_serial : 0; }
 
 void audio_init(void) {
     DIR *d = opendir(MP3_DIR);
@@ -229,6 +241,7 @@ void audio_init(void) {
     }
     if (d) closedir(d);
     if (!nnames || !(ring = malloc(RING * 4))) return;
+    badmap = calloc(nnames, 1);
     mm_ds_system sys;
     memset(&sys, 0, sizeof sys);
     sys.fifo_channel = FIFO_MAXMOD;
@@ -255,4 +268,5 @@ const char *audio_name(int i) { (void)i; return NULL; }
 int audio_current_index(void) { return -1; }
 int audio_next_index(void) { return -1; }
 const char *audio_next_title(void) { return NULL; }
+unsigned audio_track_serial(void) { return 0; }
 #endif

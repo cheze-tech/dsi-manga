@@ -57,9 +57,23 @@ int main(int argc, char **argv) {
         assert(audio_count() == 0);
         assert(audio_title() == NULL && audio_next_title() == NULL);
         assert(audio_name(0) == NULL && audio_current_index() == -1);
+        assert(audio_track_serial() == 0);
         assert(!audio_select(0) && audio_next_index() == -1);
         audio_toggle(); audio_next(); audio_pump(4);
         puts("empty folder: OK");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "bad")) {
+        mkdir(MP3_DIR, 0777);
+        FILE *bad = fopen("/tmp/simmp3/bad.mp3", "wb");
+        if (bad) { fputs("not an mp3", bad); fclose(bad); }
+        audio_init();
+        assert(audio_count() == 1 && audio_name(0) != NULL);
+        assert(audio_title() == NULL && audio_track_serial() == 0);
+        audio_pump(8); audio_next(); audio_toggle(); audio_select(0);
+        assert(audio_title() == NULL && audio_track_serial() == 0);
+        remove("/tmp/simmp3/bad.mp3");
+        puts("unusable mp3: OK");
         return 0;
     }
     mkdir("/tmp/simmp3", 0777);
@@ -67,6 +81,8 @@ int main(int argc, char **argv) {
     FILE *f = fopen("/tmp/simmp3/notes.txt", "w"); fputs("ignore me", f); fclose(f);
     audio_init();
     assert(audio_title() != NULL);
+    unsigned serial0 = audio_track_serial();
+    assert(serial0 > 0);
 
     // 1) shuffle: log the track order over a minute of simulated time
     const char *order[500]; int no = 0; const char *last = NULL; long silent_after_warm = 0;
@@ -90,6 +106,8 @@ int main(int argc, char **argv) {
     // 2) skip changes track immediately, pause stops consuming and resumes
     const char *before = audio_title(); audio_next();
     printf("skip: %s -> %s\n", before, audio_title()); assert(audio_title() != before);
+    assert(audio_track_serial() != serial0);
+    serial0 = audio_track_serial();
     for (int t = 0; t < 10; t++) tick();
     long p0 = played; audio_toggle(); assert(audio_paused());
     for (int t = 0; t < 60; t++) tick();
@@ -113,6 +131,10 @@ int main(int argc, char **argv) {
     assert(audio_select(pick));
     assert(audio_current_index() == pick);
     assert(strcmp(audio_title(), audio_name(pick)) == 0);
+    assert(audio_track_serial() != serial0);
+    serial0 = audio_track_serial();
+    assert(audio_select(pick));                     // selecting the same file starts it again
+    assert(audio_track_serial() != serial0);
     assert(audio_next_index() >= 0 && audio_next_index() != pick);
     assert(audio_next_title() && strcmp(audio_next_title(), audio_title()) != 0);
     audio_toggle(); assert(audio_paused());

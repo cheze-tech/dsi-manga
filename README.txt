@@ -56,23 +56,35 @@ MUSIC
   Put MP3 files in /mp3. The DSi edition plays them shuffled by default and shows
   the current file name in the library. The reader has a compact top-left overlay
   with NOW / NEXT (and PAUSED while paused); an empty /mp3 folder shows
-  "No MP3s in /mp3". L+R+A in the reader opens the music menu, where the list of
-  detected tracks, the current track, the planned next track, manual selection,
-  pause/resume and next-track controls are available. B closes the menu and music
-  keeps playing. Empty folders and unsupported files are skipped; if no track can
-  be decoded the overlay shows that music is unavailable and reading continues.
+  "No MP3s in /mp3". Every new track also shows a temporary NOW PLAYING banner
+  near the top of the reader for about three seconds; the compact NOW / NEXT
+  overlay remains, and the banner does not restart on page redraws.
+  L+A+DOWN in the reader opens the music menu, where the list of detected tracks,
+  the current track, the planned next track, manual selection, pause/resume and
+  next-track controls are available. In the menu, A plays the selected track,
+  Y pauses/resumes, R skips, D-pad up/down browses, left/right jumps ten tracks,
+  and B or START closes it. Music keeps playing while the menu is open. Empty
+  folders and unsupported files are skipped; if no track can be decoded the
+  overlay shows that music is unavailable and reading continues.
   MP3s are decoded on ARM9 by libmad; Maxmod feeds the DS sound hardware.
+
+SLEEP (DSi edition)
+  Closing the lid uses libnds/Calico's pmMainLoop sleep handling. The reader,
+  page/zoom/scroll position, display layout and an open music menu are preserved.
+  Music is paused while asleep and resumes on wake only if it was playing; music
+  that was already paused stays paused. Repeated lid cycles are supported.
 
 CONTROLS
   Library: D-pad move, A resume, B from page 1, X quality, START quit
            SELECT next song, Y pause/resume music
   Reader:  A/R next, B/L prev, D-pad left/right turn (dual: single page shift),
            Y reading direction (starts right-to-left), X zoom 1x-4x, SELECT view,
-           L+R+A music menu, zoomed: D-pad / touch-drag pan, START back to library
+           L+A+DOWN music menu, zoomed: D-pad / touch-drag pan, START back to library
            Green line along the bottom of the lower screen = reading progress
   Red square top-right = decoding. Blue strip at the top = current-page detail
   progress. Red screen = page can't be decoded (progressive JPEG etc).
-  Music overlay top-left = NOW / NEXT, or PAUSED while paused.
+  Music overlay top-left = NOW / NEXT, or PAUSED while paused. A temporary
+  NOW PLAYING banner appears near the top when a new track starts.
 
 HOST TESTS (no DSi needed)
   gcc -O1 -o test_pdf tools/test_pdf.c source/pdf.c && python3 tools/gen_test_pdfs.py ./test_pdf

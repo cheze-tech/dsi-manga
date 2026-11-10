@@ -5,12 +5,13 @@
 // Reader
 //   A next   B prev   D-pad left/right = turn (reading direction)
 //   R / L = rotate view forward / back   Y flip reading direction   X zoom (1x..4x)
-//   SELECT = next song   L+R+A = music menu   START library
+//   SELECT = next song   L+A+DOWN = music menu   START library
 //   (.txt files: A/R/L/B/D-pad turn pages)
 //   Views: PORTRAIT (one page over both screens) -> SPREAD (one wide page over both
 //   screens, console held sideways) -> DUAL (two pages, one per screen, held sideways)
 //   Zoomed: D-pad or touch-drag pans.  The green line at the bottom is progress.
 #include <nds.h>
+#include <calico/nds/pm.h>
 #include <fat.h>
 #include <dirent.h>
 #include <stdbool.h>
@@ -70,6 +71,15 @@ static Up g_up;             // current-page detail upgrade (chunked JPEG decode)
 #define HI_CAP (4u << 20)   // cap for one zoomed page; grayscale full-res usually fits
 static Book bk[MAXBOOKS];   // the library
 static int nbook;
+static int g_quit;
+
+// Calico handles the lid switch and DSi power button through pmMainLoop().
+// Returning false means the app should exit; keeping this flag lets nested
+// reader/menu loops unwind cleanly instead of continuing after a reset request.
+static int pm_ok(void) {
+    if (!pmMainLoop()) { g_quit = 1; return 0; }
+    return 1;
+}
 
 static size_t ram_reserve(size_t ram) {
     return ram < (6u << 20) ? (2u << 20) : (1536u << 10);
@@ -107,7 +117,14 @@ static void gfx_library(void) {          // top = bitmap grid, bottom = text con
     consoleDemoInit();
 }
 
-static void wait_key(void) { do { swiWaitForVBlank(); scanKeys(); audio_pump(4); } while (!keysDown()); }
+static void wait_key(void) {
+    do {
+        if (!pm_ok()) return;
+        swiWaitForVBlank();
+        scanKeys();
+        audio_pump(4);
+    } while (!keysDown());
+}
 
 // viewer coordinates (u right, v down) -> pixel. Portrait: 256 x (384+gap). Book: (384+gap) x 256.
 // The `gap` rows/columns between the two screens are skipped, so the picture stays in
@@ -579,6 +596,12 @@ extern const unsigned char default_font_bin[];
 #define MUSIC_ROWS ((192 - MUSIC_TOP) / MUSIC_ROW)
 #define MUSIC_STATUS_W 176
 #define MUSIC_STATUS_H 18
+#define MUSIC_NOTICE_FRAMES (3 * 60)   // about 3 seconds at 60 fps
+
+static u32 music_notice_frames;       // independent of reader redraws
+static unsigned music_notice_serial;
+static PmEventCookie music_pm_cookie;
+static int music_resume_after_sleep;
 static int music_dirty = 1;
 
 static inline u16 ui_col(int r, int g, int b) { return RGB15(r, g, b) | BIT(15); }
@@ -673,6 +696,50 @@ static void music_status_check(void) {
     }
 }
 
+// A new track gets a separate, short-lived banner. The serial changes on actual
+// track starts (including selecting the same file again), never on page redraws.
+static int music_notice_tick(void) {
+    unsigned serial = audio_track_serial();
+    int expired = 0;
+    if (serial != music_notice_serial) {
+        u32 old = music_notice_frames;
+        music_notice_serial = serial;
+        music_notice_frames = serial ? MUSIC_NOTICE_FRAMES : 0;
+        if (!serial && old) expired = 1;
+        music_dirty = 1;
+    }
+    if (music_notice_frames && --music_notice_frames == 0) expired = 1;
+    return expired;
+}
+
+static void music_notice_draw(void) {
+    if (!scr[0] || !music_notice_frames) return;
+    const char *title = audio_title();
+    if (!title) return;
+    char line[40];
+    // Below the decode strip and busy square, but still near the top. The
+    // compact NOW/NEXT overlay stays visible above it.
+    ui_rect(scr[0], 0, 22, 248, 28, ui_col(2, 5, 10));
+    ui_rect(scr[0], 0, 22, 3, 28, ui_col(8, 31, 12));
+    ui_rect(scr[0], 0, 49, 248, 1, ui_col(18, 28, 31));
+    ui_text(scr[0], 8, 24, "NOW PLAYING", ui_col(18, 28, 31), -1);
+    ui_fit(line, sizeof line, title, 30);
+    ui_text(scr[0], 8, 35, line, ui_col(31, 31, 31), 30);
+}
+
+// Pause music before sleep, but only resume it on wake if it was playing.
+static void music_pm_event(void *user, PmEvent event) {
+    (void)user;
+    if (event == PmEvent_OnSleep) {
+        const char *title = audio_title();
+        music_resume_after_sleep = title != NULL && !audio_paused();
+        if (music_resume_after_sleep) audio_toggle();
+    } else if (event == PmEvent_OnWakeup) {
+        if (music_resume_after_sleep && audio_title() && audio_paused()) audio_toggle();
+        music_resume_after_sleep = 0;
+    }
+}
+
 static void draw_music_menu(int sel, int *first) {
     int n = audio_count();
     int cur = audio_current_index();
@@ -725,8 +792,8 @@ static void draw_music_menu(int sel, int *first) {
     ui_text(scr[1], 4, 100, "A  play selected", ui_col(24, 24, 28), -1);
     ui_text(scr[1], 4, 112, "Y  pause / resume", ui_col(24, 24, 28), -1);
     ui_text(scr[1], 4, 124, "R  next track", ui_col(24, 24, 28), -1);
-    ui_text(scr[1], 4, 136, "B  close menu", ui_col(24, 24, 28), -1);
-    ui_text(scr[1], 4, 148, "D-pad  browse list", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 136, "B/START  close menu", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 148, "D-pad  browse / jump 10", ui_col(24, 24, 28), -1);
     ui_text(scr[1], 4, 168, "Music continues while open", ui_col(14, 18, 22), -1);
 }
 
@@ -738,6 +805,7 @@ static void music_menu(void) {
     const char *shown_title = audio_title(), *shown_next = audio_next_title();
     int shown_paused = audio_paused();
     for (;;) {
+        if (!pm_ok()) return;
         if (redraw) { draw_music_menu(sel, &first); redraw = 0; }
         swiWaitForVBlank();
         scanKeys();
@@ -937,6 +1005,8 @@ static void reader(Book *b, const char *path, int start) {
     g_curpage = page;
     int view = cfg.view, rtl = cfg.rtl, f = 1, ox = 0, oy = 0, dirty = 1, turns = 0, tx = -1, ty = -1;
     int page_changed = 0, turn_dir = 1, prefetch_pending = 1, combo_latch = 0;
+    u32 combo_pending = 0;
+    int combo_wait = 0;
     b->npages = n;
     // Small books: current + 2 back + 2 ahead in RAM. Large books: current + 1 each way.
     g_nslot = pdf.size < (5u << 20) ? g_maxslot : (g_maxslot >= 5 ? 3 : g_maxslot);
@@ -958,11 +1028,26 @@ static void reader(Book *b, const char *path, int start) {
     touchPosition tp;
 
     for (;;) {
+        if (!pm_ok()) break;
         swiWaitForVBlank();
         scanKeys();
         u32 dn = keysDown() | g_pend, hd = keysHeld(), kl, kr, ku, kd;
         g_pend = 0;
-        u32 combo = KEY_L | KEY_R | KEY_A;
+        u32 combo = KEY_L | KEY_A | KEY_DOWN;
+
+        // L, A and DOWN all have normal reader actions. The shortcut is
+        // L -> A -> DOWN in practice, so defer L, and defer A/DOWN only while
+        // they are part of that prefix. A page turn or DOWN pan on its own is
+        // therefore never delayed; a sequential chord cannot leak actions.
+        u32 defer = 0;
+        if (dn & KEY_L) defer |= KEY_L;
+        if ((dn & KEY_A) && ((hd | combo_pending) & KEY_L)) defer |= KEY_A;
+        if ((dn & KEY_DOWN) && ((hd | combo_pending) & (KEY_L | KEY_A))) defer |= KEY_DOWN;
+        if (defer) {
+            combo_pending |= defer;
+            combo_wait = 2;
+            dn &= ~defer;
+        }
         if ((hd & combo) == combo) {
             if (!combo_latch) {
                 combo_latch = 1;
@@ -970,13 +1055,21 @@ static void reader(Book *b, const char *path, int start) {
                 dirty = 1;
                 music_dirty = 1;
             }
-            dn = 0; hd = 0;                 // never turn/rotate on L+R+A
-        } else combo_latch = 0;
+            combo_pending = 0; combo_wait = 0;
+            dn = 0; hd = 0;                 // never turn/rotate on L+A+DOWN
+        } else {
+            combo_latch = 0;
+            if (combo_pending) {
+                if (combo_wait) combo_wait--;
+                else { dn |= combo_pending; combo_pending = 0; }
+            }
+        }
         if (dn & KEY_START) break;
         int vd = ((dn & KEY_R) ? 1 : 0) - ((dn & KEY_L) ? 1 : 0);          // R rotate forward, L back
         if (vd) { view = (view + V_COUNT + vd) % V_COUNT; f = 1; oy = 0; ox = rtl ? 1 << 20 : 0; dirty = 1; }
         if (dn & KEY_SELECT) audio_next();
         audio_pump(4);
+        if (music_notice_tick()) dirty = 1;
         g_rot = rot_of(view);                                  // after the view may have changed
         vkeys(&kl, &kr, &ku, &kd);
         int dual = is_dual(view), step = 0, pan0 = rtl ? 1 << 20 : 0;
@@ -1090,7 +1183,7 @@ static void reader(Book *b, const char *path, int start) {
             }
         }
         music_status_check();
-        if (music_dirty) { music_status_draw(); music_dirty = 0; }
+        if (music_dirty) { music_status_draw(); music_notice_draw(); music_dirty = 0; }
     }
     cfg.view = view; cfg.rtl = rtl;
     b->page = page;
@@ -1210,6 +1303,7 @@ static void txt_reader(Book *b, const char *path, int start) {
     gfx_text();
 
     for (;;) {
+        if (!pm_ok()) break;
         swiWaitForVBlank();
         scanKeys();
         audio_pump(4);
@@ -1288,8 +1382,11 @@ int main(void) {
     g_slot = slot_budget(ram, g_maxslot);
     tables_init();
     audio_init();
+    pmSetSleepAllowed(true);
+    pmAddEventHandler(&music_pm_cookie, music_pm_event, NULL);
 
     for (;;) {
+        if (g_quit) return 0;
         const char *dir = "/manga/";
         int n = nbook = scan_dir(dir, bk);
         if (!n) n = nbook = scan_dir(dir = "/", bk);
@@ -1313,7 +1410,12 @@ int main(void) {
                 }
             }
             draw_library(sel, dir);
-            do { swiWaitForVBlank(); scanKeys(); audio_pump(4); } while (!keysDown());
+            do {
+                if (!pm_ok()) { lib_save(); return 0; }
+                swiWaitForVBlank();
+                scanKeys();
+                audio_pump(4);
+            } while (!keysDown());
             u32 k = keysDown();
             if (k & KEY_SELECT) audio_next();
             if (k & KEY_Y) audio_toggle();
@@ -1332,6 +1434,7 @@ int main(void) {
                 if (b->kind) txt_reader(b, p, startpage); else reader(b, p, startpage);
                 b->last = time(NULL);
                 lib_save();
+                if (g_quit) return 0;
                 break;
             }
         }
