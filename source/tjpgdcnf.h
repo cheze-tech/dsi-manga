@@ -5,7 +5,7 @@
 #define	JD_SZBUF		512
 /* Specifies size of stream input buffer */
 
-#define JD_FORMAT		1       // RGB565 straight from the decoder: no per-pixel 888->565 pass
+#define JD_FORMAT		0       // RGB888: kept as the 355f1a7 load-path baseline
 /* Specifies output pixel format.
 /  0: RGB888 (24-bit/pix)
 /  1: RGB565 (16-bit/pix)
