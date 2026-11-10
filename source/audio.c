@@ -37,6 +37,11 @@ int audio_shuffle_next(void) {
 #include <maxmod9.h>
 #include <mad.h>
 
+// Older libnds exposed FIFO_MAXMOD; current libnds documents the maxmod FIFO channel as 7.
+#ifndef FIFO_MAXMOD
+#define FIFO_MAXMOD 7
+#endif
+
 #define RING 65536              // stereo frames of decoded audio waiting to be played (~1.5 s)
 
 static s16 *ring;

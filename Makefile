@@ -23,6 +23,8 @@ endif
 PORTLIBS  ?= $(wildcard $(DEVKITPRO)/portlibs/nds) $(wildcard $(DEVKITPRO)/portlibs/armv5te) $(wildcard $(DEVKITPRO)/portlibs/armv4t) $(wildcard $(DEVKITPRO)/portlibs/arm)
 PORTINC   := $(foreach d,$(PORTLIBS),-I$(d)/include)
 PORTLIB   := $(foreach d,$(PORTLIBS),-L$(d)/lib)
+MAD_HEADER  := $(firstword $(wildcard $(addsuffix /include/mad.h,$(PORTLIBS))))
+MAD_LIBRARY := $(firstword $(wildcard $(addsuffix /lib/libmad.a,$(PORTLIBS))))
 # DSi-enhanced gamecard. 00030004 is DSiWare and cannot be loaded as a card;
 # 80040407 is ndstool's default "allow access to everything" ARM7 SCFG mask.
 DSIFLAGS  ?= -u 00030000 -z 80040407
@@ -39,6 +41,28 @@ dsimanga.elf: $(COMMON) source/main.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lfat -lnds9 -lcalico_ds9 -o $@
 dsimanga_dsi.elf: $(COMMON) source/enhanced.c source/audio.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(AUDIO_LIBS) -lfat -lnds9 -lcalico_ds9 -o $@
+
+ifeq ($(AUDIO),1)
+dsimanga_dsi.elf: | check-audio-deps
+endif
+
+.PHONY: check-audio-deps
+check-audio-deps:
+	@test -n "$(MAD_HEADER)" || { \
+		echo "ERROR: mad.h was not found. Install devkitPro's nds-libmad package:"; \
+		echo "  dkp-pacman -S --needed nds-libmad"; \
+		exit 1; \
+	}
+	@test -n "$(MAD_LIBRARY)" || { \
+		echo "ERROR: libmad.a was not found. Install devkitPro's nds-libmad package:"; \
+		echo "  dkp-pacman -S --needed nds-libmad"; \
+		exit 1; \
+	}
+	@test -f "$(LIBNDS)/include/maxmod9.h" -a -f "$(LIBNDS)/lib/libmm9.a" || { \
+		echo "ERROR: Maxmod headers/library were not found. Install the NDS development group:"; \
+		echo "  dkp-pacman -S --needed nds-dev"; \
+		exit 1; \
+	}
 
 dsimanga.nds: dsimanga.elf
 	$(NDSTOOL) -c $@ -9 $< -7 $(DEVKITPRO)/calico/bin/ds7_maine.elf

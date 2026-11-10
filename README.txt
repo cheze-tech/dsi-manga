@@ -27,7 +27,10 @@ ENHANCED  (source/enhanced.c)  for DSi mode / 16 MB RAM:
 
 BUILD
   1. Install devkitPro (devkitARM, libnds, libfat), plus maxmod and libmad for DSi
-     music. libmad is in devkitPro's portlibs; maxmod provides libmm9.a.
+     music:
+       dkp-pacman -S --needed nds-dev nds-libmad
+     nds-libmad installs mad.h and libmad.a into portlibs/nds; maxmod provides
+     libmm9.a. The official devkitpro/devkitarm Docker image already contains both.
   2. Download TJpgDec (elm-chan.org/fsw/tjpgd/00index.html), copy tjpgd.c, tjpgd.h,
      tjpgdcnf.h into source/.  In tjpgdcnf.h:  JD_USE_SCALE 1   JD_TBLCLIP 1
      JD_FASTDECODE 1  (the 32-bit ARM9 path; JD_FORMAT 0 or 1 both work).
