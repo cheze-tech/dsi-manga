@@ -111,6 +111,7 @@ static int decode_frame(void) {
             if (ms.next_frame) { keep = ms.bufend - ms.next_frame; memmove(inbuf, ms.next_frame, keep); }
             size_t got = fread(inbuf + keep, 1, sizeof inbuf - MAD_BUFFER_GUARD - keep, mp);
             if (!got) return 0;
+            memset(inbuf + keep + got, 0, MAD_BUFFER_GUARD);
             mad_stream_buffer(&ms, inbuf, keep + got);
             ms.error = MAD_ERROR_NONE;
         }
@@ -159,8 +160,11 @@ void audio_init(void) {
     while (d && (e = readdir(d)) && nnames < 512) {
         size_t l = strlen(e->d_name);
         if (l > 4 && !strcasecmp(e->d_name + l - 4, ".mp3")) {
-            names = realloc(names, (nnames + 1) * sizeof *names);
-            names[nnames++] = strdup(e->d_name);
+            char **nn = realloc(names, (nnames + 1) * sizeof *names);
+            if (!nn) break;
+            names = nn;
+            if (!(names[nnames] = strdup(e->d_name))) break;
+            nnames++;
         }
     }
     if (d) closedir(d);
@@ -176,6 +180,7 @@ void audio_init(void) {
 }
 
 #else   // built without AUDIO=1: no music, everything is a no-op
+#warning "audio.c built without USE_AUDIO; MP3 playback is disabled"
 void audio_init(void) {}
 void audio_pump(int max_frames) { (void)max_frames; }
 void audio_next(void) {}

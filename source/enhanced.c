@@ -1,7 +1,7 @@
 // DSi Enhanced PDF/manga reader: uses the DSi's 16 MB RAM.
 //
 // Library (top = cover grid, bottom = details)
-//   D-pad move   A resume   B open from page 1   X quality   Y book hold   START quit
+//   D-pad move   A resume   B open from page 1   X quality   Y pause music   START quit
 // Reader
 //   A next   B prev   D-pad left/right = turn (reading direction)
 //   R / L = rotate view forward / back   Y flip reading direction   X zoom (1x..4x)
@@ -255,7 +255,8 @@ static Slot *slot_for(int pg) {
 }
 static void make_room(size_t need, int keep);
 
-static Img *load_detail(Pdf *pdf, int pg, u8 *bad, int want, size_t budget, int abortable) {
+static Img *load_detail(Pdf *pdf, int pg, u8 *bad, int want, size_t budget, int abortable, int *status) {
+    if (status) *status = 0;
     Slot *s = find_slot(pg);
     if (s && s->im.px) {
         if (s->want >= want) return &s->im;
@@ -265,14 +266,14 @@ static Img *load_detail(Pdf *pdf, int pg, u8 *bad, int want, size_t budget, int 
             if (ns >= s->scale) { s->want = want; return &s->im; }
         }
     }
-    if (!s) { s = slot_for(pg); if (!s) return NULL; }
+    if (!s) { s = slot_for(pg); if (!s) { if (status) *status = -1; return NULL; } }
     make_room(budget, pg);
     int same = s->page == pg && s->im.px;
     Img old = s->im;
     size_t oldbytes = s->bytes;
     Img tmp; int sc = 0, sw = 0, sh = 0;
     int rc = decode_into(pdf, pg, &tmp, abortable, want, budget, &sc, &sw, &sh);
-    if (rc) { if (!same && rc == -1) bad[pg] = 1; return same ? &s->im : NULL; }
+    if (rc) { if (status) *status = rc; if (!same && rc == -1) bad[pg] = 1; return same ? &s->im : NULL; }
     size_t tb = (size_t)tmp.w * tmp.h * (tmp.gray ? 1 : 2);
     if (g_cachebytes + tb > g_cachepeak) g_cachepeak = g_cachebytes + tb;
     if (same) {
@@ -286,6 +287,16 @@ static Img *load_detail(Pdf *pdf, int pg, u8 *bad, int want, size_t budget, int 
     g_cachebytes += tb;
     if (g_cachebytes > g_cachepeak) g_cachepeak = g_cachebytes;
     return &s->im;
+}
+
+// Load a cheap preview for the page the reader is most likely to show next.
+// Returns 1 when there is nothing left to do (cached, bad, out of range or
+// completed), or 0 when the decode was interrupted by input and should retry.
+static int prefetch_page(Pdf *pdf, int pg, int n, int target, u8 *bad) {
+    if (pg < 0 || pg >= n || bad[pg] || cached(pg)) return 1;
+    int status = 0;
+    load_detail(pdf, pg, bad, target, g_slot, 1, &status);
+    return status == -2 ? 0 : 1;
 }
 
 // Background current-page upgrade -------------------------------------------------
@@ -544,6 +555,20 @@ static void busy(void) {                      // little red square = decoding
     for (int y = 0; y < 6; y++) for (int x = 250; x < 256; x++) scr[0][y * 256 + x] = RGB15(31, 0, 0) | BIT(15);
 }
 
+// Small progress strip for the current-page background decode.
+static void decode_progress(void) {
+    if (!g_up.active || !scr[0]) return;
+    int total = g_up.jd.height;
+    int w = total > 0 ? (int)((long long)g_up.jd.y * 64 / total) : 0;
+    if (w < 0) w = 0;
+    if (w > 64) w = 64;
+    for (int y = 0; y < 3; y++) {
+        u16 *row = scr[0] + y * 256 + 186;
+        for (int x = 0; x < 64; x++)
+            row[x] = x < w ? (RGB15(4, 24, 31) | BIT(15)) : (RGB15(4, 4, 4) | BIT(15));
+    }
+}
+
 // d-pad keys as the viewer sees them for the current orientation
 static void vkeys(u32 *l, u32 *r, u32 *u, u32 *d) {
     if (g_rot == 0)      { *l = KEY_LEFT; *r = KEY_RIGHT; *u = KEY_UP;   *d = KEY_DOWN; }
@@ -709,7 +734,7 @@ static void reader(Book *b, const char *path, int start) {
     int page = start < 0 ? 0 : start >= n ? n - 1 : start;
     g_curpage = page;
     int view = cfg.view, rtl = cfg.rtl, f = 1, ox = 0, oy = 0, dirty = 1, turns = 0, tx = -1, ty = -1;
-    int page_changed = 0;
+    int page_changed = 0, turn_dir = 1, prefetch_pending = 1;
     b->npages = n;
     // Small books: current + 2 back + 2 ahead in RAM. Large books: current + 1 each way.
     g_nslot = pdf.size < (5u << 20) ? g_maxslot : (g_maxslot >= 5 ? 3 : g_maxslot);
@@ -758,6 +783,7 @@ static void reader(Book *b, const char *path, int start) {
         if (dn & KEY_Y) { rtl ^= 1; ox = rtl ? 1 << 20 : 0; dirty = 1; }
         if ((dn & KEY_X) && !dual) { f = f % 4 + 1; ox = pan0; oy = 0; dirty = 1; }
         if (step) {
+            turn_dir = step > 0 ? 1 : -1;
             int np = page + step;
             if (np < 0) np = 0;
             if (np > n - 1) np = n - 1;
@@ -796,32 +822,46 @@ static void reader(Book *b, const char *path, int start) {
             page_changed = 0;
             up_cancel();
             drop_hi_except(page);
+            prefetch_pending = 1;                              // next page preview before detail
         }
         if (dirty) {
             dirty = 0;
             trim(page - span, page + span);
             if (!cached(page)) {                               // first view of this page
                 busy();
-                load_detail(&pdf, page, bad, (!dual && was_turn) ? preview : base, g_slot, 0);
+                load_detail(&pdf, page, bad, (!dual && was_turn) ? preview : base, g_slot, 0, NULL);
             }
             if (dual && page + 1 < n && !cached(page + 1)) {
                 busy();
-                load_detail(&pdf, page + 1, bad, base, g_slot, 0);
+                load_detail(&pdf, page + 1, bad, base, g_slot, 0, NULL);
             }
             draw_view(view, page, n, rtl, f, &ox, &oy, bad);
             progress_line(page, n);
         }
 
-        // Current page first: sharpen it in the background, one small chunk per
+        // The immediately upcoming page is more valuable than a sharper current
+        // page: fill its preview before starting the multi-second detail decode.
+        // If a key is still held, wait; a preview decode would immediately abort.
+        if (prefetch_pending && !hd) {
+            int ahead = dual ? 2 : 1;
+            int nextpg = page + (turn_dir < 0 ? -ahead : ahead);
+            // DUAL has no background detail upgrade, so its prefetched spread
+            // must already be at the normal dual-page quality.
+            if (prefetch_page(&pdf, nextpg, n, dual ? base : preview, bad)) prefetch_pending = 0;
+        }
+
+        // Current page next: sharpen it in the background, one small chunk per
         // frame. Zoom detail is decoded once at the widest useful target, so
         // 2x/3x/4x reuse it instead of re-decoding the same resolution.
-        if (!dual) {
+        if (!dual && !prefetch_pending) {
             int target = f > 1 ? view_px(view) * 4 : base;
             up_start(&pdf, page, target, f > 1 ? g_hi : g_slot);
         }
         if (g_up.active) {
             if (up_step()) dirty = 1;                          // better image is ready
-        } else if (!hd && !dn) {                               // idle: fast previews only
+            busy();
+            decode_progress();
+        } else if (!hd && !dn && !prefetch_pending) {           // idle: fast previews only
             int cand[4];
             int nc = 0, hi = page + span + (dual ? 1 : 0);
             int pv = dual ? base : preview;
@@ -832,7 +872,7 @@ static void reader(Book *b, const char *path, int start) {
             for (int i = 0; i < nc; i++) {
                 int c = cand[i];
                 if (c >= page - span && c <= hi && c >= 0 && c < n &&
-                    !bad[c] && !cached(c)) { load_detail(&pdf, c, bad, pv, g_slot, 1); break; }
+                    !bad[c] && !cached(c)) { load_detail(&pdf, c, bad, pv, g_slot, 1, NULL); break; }
             }
         }
     }

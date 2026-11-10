@@ -1,6 +1,6 @@
 // Background music: plays every .mp3 in /mp3 in shuffled order (a track never repeats
-// until the whole folder has played). Needs libmad + maxmod; build with `make dsi AUDIO=1`.
-// Without AUDIO=1 every function here does nothing.
+// until the whole folder has played). Built into the DSi edition by default (libmad + maxmod);
+// `make dsi AUDIO=0` builds without music, and every function here then does nothing.
 #pragma once
 void audio_init(void);             // find /mp3 files and start playing (silently does nothing if none)
 void audio_pump(int max_frames);   // call OFTEN: decodes a little MP3 and feeds the sound hardware
