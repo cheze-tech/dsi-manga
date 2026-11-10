@@ -5,7 +5,8 @@
 // Reader
 //   A next   B prev   D-pad left/right = turn (reading direction)
 //   R / L = rotate view forward / back   Y flip reading direction   X zoom (1x..4x)
-//   SELECT = next song   L+A+DOWN = music menu   START library
+//   SELECT = next song   L+A+DOWN = music menu   L+UP = toggle overlay
+//   START library
 //   (.txt files: A/R/L/B/D-pad turn pages)
 //   Views: PORTRAIT (one page over both screens) -> SPREAD (one wide page over both
 //   screens, console held sideways) -> DUAL (two pages, one per screen, held sideways)
@@ -22,6 +23,7 @@
 #include <time.h>
 #include "pdf.h"
 #include "audio.h"
+#include "id3art.h"
 #include "tjpgd.h"          // TJpgDec R0.03: JD_USE_SCALE 1, JD_FORMAT 0 or 1
 #if !JD_USE_SCALE
 #error "tjpgdcnf.h: set JD_USE_SCALE 1"
@@ -198,8 +200,21 @@ static int choose_scale(int sw, int sh, int bpp, int target, size_t budget) {
     for (;; s++) {
         int w = (sw + (1 << s) - 1) >> s;
         int h = (sh + (1 << s) - 1) >> s;
-        if ((size_t)w * h * bpp <= budget || s >= 3) return s;
+        if ((size_t)w * h * bpp <= budget || s >= 3) break;
     }
+    // Do not spend time decoding more than twice the pixels the display can
+    // use. Keep at least the requested target width/height; this only removes
+    // detail that would be discarded by the screen anyway.
+    while (s < 3) {
+        int w = (sw + (1 << s) - 1) >> s;
+        int h = (sh + (1 << s) - 1) >> s;
+        int nw = (sw + (1 << (s + 1)) - 1) >> (s + 1);
+        int nh = (sh + (1 << (s + 1)) - 1) >> (s + 1);
+        if (w <= target * 2 && h <= target * 2) break;
+        if (nw < target || nh < target) break;
+        s++;
+    }
+    return s;
 }
 
 // 0 ok, -1 failed, -2 interrupted. Gray JPEGs use 1 byte/pixel, so they decode
@@ -352,9 +367,12 @@ static void make_room(size_t need, int keep) {
 static int up_start(Pdf *pdf, int pg, int want, size_t budget) {
     if (g_up.active) {
         if (g_up.page == pg) {
+            // g_up.want is the final target, not the current intermediate
+            // stage. Do not cancel a stage merely because it is not final.
+            if (g_up.want >= want) return 0;
             int ns = choose_scale(g_up.srcw, g_up.srch, g_up.im.gray ? 1 : 2, want, budget);
             if (ns >= g_up.scale) {
-                if (want > g_up.want) g_up.want = want;
+                g_up.want = want;
                 return 0;
             }
         }
@@ -362,11 +380,12 @@ static int up_start(Pdf *pdf, int pg, int want, size_t budget) {
     }
     Slot *s = find_slot(pg);
     if (!s || !s->im.px) return -1;
-    if (budget <= g_slot && s->want >= want) return 0;
     if (s->scale == 0) { if (want > s->want) s->want = want; return 0; }
-    if (s->srcw > 0) {
-        int ns = choose_scale(s->srcw, s->srch, s->im.gray ? 1 : 2, want, budget);
-        if (ns >= s->scale) { if (want > s->want) s->want = want; return 0; }
+    int final_s = s->srcw > 0 ?
+        choose_scale(s->srcw, s->srch, s->im.gray ? 1 : 2, want, budget) : 0;
+    if (s->srcw > 0 && final_s >= s->scale) {
+        if (want > s->want) s->want = want;
+        return 0;
     }
 
     memset(&g_up, 0, sizeof g_up);
@@ -381,7 +400,12 @@ static int up_start(Pdf *pdf, int pg, int want, size_t budget) {
     g_up.srcw = g_up.jd.width; g_up.srch = g_up.jd.height;
     g_up.im.gray = g_up.jd.ncomp == 1;
     int bpp = g_up.im.gray ? 1 : 2;
-    int sc = choose_scale(g_up.srcw, g_up.srch, bpp, want, budget);
+    final_s = choose_scale(g_up.srcw, g_up.srch, bpp, want, budget);
+    // Show one faster intermediate when the current image is more than one
+    // JPEG step away from the final target. The next call goes straight to the
+    // final scale; final quality is unchanged.
+    int sc = final_s;
+    if (s->want < want && s->scale > final_s + 1) sc = final_s + 1;
     size_t need = 0;
     for (;;) {
         g_up.im.w = (g_up.srcw + (1 << sc) - 1) >> sc;
@@ -404,12 +428,15 @@ static int up_start(Pdf *pdf, int pg, int want, size_t budget) {
 }
 
 // Returns 1 when the slot image was replaced (redraw), 0 otherwise.
-static int up_step(void) {
+// fast is used only when no input is pending; it spends more idle CPU per
+// frame without making a held button wait longer for its next frame.
+static int up_step(int fast) {
     if (!g_up.active) return 0;
     // Grayscale JPEGs use 8x8 MCUs; scale the budget by MCU area so a chunk
     // costs about the same on grayscale and colour pages.
     unsigned int blocks = (unsigned int)g_up.jd.msx * g_up.jd.msy;
-    unsigned int mc = blocks ? UP_PIXELS / (blocks * 64u) : 192u;
+    unsigned int pixels = fast ? UP_PIXELS * 2 : UP_PIXELS;
+    unsigned int mc = blocks ? pixels / (blocks * 64u) : 192u;
     if (mc < 32) mc = 32;
     JRESULT r = jd_decomp_step(&g_up.jd, jout, mc);
     if (r == JDR_MORE) return 0;
@@ -603,6 +630,7 @@ static unsigned music_notice_serial;
 static PmEventCookie music_pm_cookie;
 static int music_resume_after_sleep;
 static int music_dirty = 1;
+static int music_overlay_on = 1;       // L+UP toggles the compact NOW/NEXT overlay
 
 static inline u16 ui_col(int r, int g, int b) { return RGB15(r, g, b) | BIT(15); }
 
@@ -662,7 +690,7 @@ static void ui_label(char *out, size_t n, const char *label, const char *value, 
 // Compact top-left overlay. It stays out of the decode strip (x=186) and the
 // busy square (x=250), and never gets larger than two short lines.
 static void music_status_draw(void) {
-    if (!scr[0]) return;
+    if (!scr[0] || !music_overlay_on) return;
     const char *title = audio_title();
     if (!title) {
         if (audio_count() == 0) {
@@ -698,6 +726,130 @@ static void music_status_check(void) {
 
 // A new track gets a separate, short-lived banner. The serial changes on actual
 // track starts (including selecting the same file again), never on page redraws.
+// ---- album artwork ---------------------------------------------------------
+// Artwork is loaded only while the music menu is visible. It uses its own
+// small TJpgDec pool so an in-progress reader detail decode is never disturbed.
+#define ART_W 72
+#define ART_H 72
+#define ART_X 176
+#define ART_Y 88
+#define ART_POOL 8192
+
+static u16 art_px[ART_W * ART_H];
+static int art_state;                  // 0 unknown, 1 ready, 2 placeholder
+static unsigned art_serial;
+static unsigned char art_pool[ART_POOL];
+
+typedef struct {
+    const unsigned char *src;
+    size_t len, pos;
+    u16 *px;
+    int w, h, tick;
+} ArtDec;
+
+static size_t art_in(JDEC *jd, uint8_t *buf, size_t n) {
+    ArtDec *a = jd->device;
+    if (n > a->len - a->pos) n = a->len - a->pos;
+    if (buf) memcpy(buf, a->src + a->pos, n);
+    a->pos += n;
+    return n;
+}
+
+static int art_out(JDEC *jd, void *bm, JRECT *r) {
+    ArtDec *a = jd->device;
+    if ((++a->tick & 31) == 0) audio_pump(1);
+    int w = r->right - r->left + 1;
+    for (int y = r->top; y <= r->bottom; y++) {
+        if (y >= a->h) continue;
+        int n = a->w - r->left; if (n > w) n = w;
+        if (n <= 0) continue;
+        u16 *dst = a->px + y * a->w + r->left;
+        int row = y - r->top;
+#if JD_FORMAT == 0
+        const uint8_t *s = (const uint8_t *)bm + row * w * 3;
+        for (int x = 0; x < n; x++, s += 3)
+            dst[x] = ((s[0] >> 3) | ((s[1] >> 3) << 5) | ((s[2] >> 3) << 10)) | BIT(15);
+#else
+        const u16 *s = (const u16 *)bm + row * w;
+        for (int x = 0; x < n; x++) dst[x] = c565(s[x]);
+#endif
+    }
+    return 1;
+}
+
+static void art_fit(const u16 *src, int sw, int sh, u16 *dst) {
+    if (sw <= 0 || sh <= 0) return;
+    int vw = ART_W, vh = ART_H;
+    if ((long long)sw * ART_H > (long long)ART_W * sh) vh = (int)((long long)sh * ART_W / sw);
+    else vw = (int)((long long)sw * ART_H / sh);
+    if (vw < 1) vw = 1;
+    if (vh < 1) vh = 1;
+    int ox = (ART_W - vw) / 2, oy = (ART_H - vh) / 2;
+    for (int y = 0; y < vh; y++) {
+        int sy = y * sh / vh;
+        for (int x = 0; x < vw; x++) {
+            int sx = x * sw / vw;
+            dst[(oy + y) * ART_W + ox + x] = src[sy * sw + sx];
+        }
+    }
+}
+
+static void music_art_load(void) {
+    unsigned serial = audio_track_serial();
+    if (serial == art_serial && art_state) return;
+    art_serial = serial;
+    art_state = 2;                       // placeholder until a picture decodes
+    if (!serial) return;
+
+    int idx = audio_current_index();
+    const char *name = idx >= 0 ? audio_name(idx) : NULL;
+    if (!name) return;
+    char path[360];
+    snprintf(path, sizeof path, "%s%s", audio_music_dir(), name);
+
+    Id3Art art;
+    if (!id3art_load(path, &art)) return;
+
+    ArtDec d;
+    memset(&d, 0, sizeof d);
+    d.src = art.data;
+    d.len = art.len;
+    JDEC jd;
+    if (jd_prepare(&jd, art_in, art_pool, sizeof art_pool, &d) != JDR_OK) {
+        id3art_free(&art);
+        return;
+    }
+    int sc = 0;
+    while (sc < 3 && ((jd.width >> (sc + 1)) >= ART_W || (jd.height >> (sc + 1)) >= ART_H)) sc++;
+    int aw = (jd.width + (1 << sc) - 1) >> sc;
+    int ah = (jd.height + (1 << sc) - 1) >> sc;
+    if (aw < 1 || ah < 1) { id3art_free(&art); return; }
+    u16 *tmp = malloc((size_t)aw * ah * 2);
+    if (!tmp) { id3art_free(&art); return; }
+    d.px = tmp; d.w = aw; d.h = ah;
+    JRESULT rc = jd_decomp(&jd, art_out, sc);
+    if (rc == JDR_OK) {
+        memset(art_px, 0, sizeof art_px);
+        art_fit(tmp, aw, ah, art_px);
+        art_state = 1;
+    }
+    free(tmp);
+    id3art_free(&art);
+}
+
+static void music_art_draw(void) {
+    if (!scr[1]) return;
+    music_art_load();
+    ui_rect(scr[1], ART_X - 1, ART_Y - 1, ART_W + 2, ART_H + 2, ui_col(10, 14, 20));
+    if (art_state == 1) {
+        for (int y = 0; y < ART_H; y++)
+            memcpy(scr[1] + (ART_Y + y) * 256 + ART_X, art_px + y * ART_W, ART_W * 2);
+    } else {
+        ui_rect(scr[1], ART_X, ART_Y, ART_W, ART_H, ui_col(3, 5, 9));
+        ui_text(scr[1], ART_X + 12, ART_Y + 30, "NO ART", ui_col(18, 18, 24), -1);
+    }
+}
+
 static int music_notice_tick(void) {
     unsigned serial = audio_track_serial();
     int expired = 0;
@@ -789,11 +941,12 @@ static void draw_music_menu(int sel, int *first) {
     ui_text(scr[1], 4, 75, audio_paused() ? "PAUSED" : "PLAYING",
             audio_paused() ? ui_col(31, 24, 0) : ui_col(8, 31, 12), -1);
 
+    music_art_draw();
     ui_text(scr[1], 4, 100, "A  play selected", ui_col(24, 24, 28), -1);
     ui_text(scr[1], 4, 112, "Y  pause / resume", ui_col(24, 24, 28), -1);
     ui_text(scr[1], 4, 124, "R  next track", ui_col(24, 24, 28), -1);
-    ui_text(scr[1], 4, 136, "B/START  close menu", ui_col(24, 24, 28), -1);
-    ui_text(scr[1], 4, 148, "D-pad  browse / jump 10", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 136, "B/START close menu", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 148, "D-pad browse/jump10", ui_col(24, 24, 28), -1);
     ui_text(scr[1], 4, 168, "Music continues while open", ui_col(14, 18, 22), -1);
 }
 
@@ -839,15 +992,29 @@ static void music_menu(void) {
     }
 }
 
-// d-pad keys as the viewer sees them for the current orientation
-static void vkeys(u32 *l, u32 *r, u32 *u, u32 *d) {
-    if (g_rot == 0)      { *l = KEY_LEFT; *r = KEY_RIGHT; *u = KEY_UP;   *d = KEY_DOWN; }
-    else if (g_rot == 1) { *l = KEY_UP;   *r = KEY_DOWN;  *u = KEY_RIGHT; *d = KEY_LEFT; }
-    else                 { *l = KEY_DOWN; *r = KEY_UP;    *u = KEY_LEFT;  *d = KEY_RIGHT; }
-}
-
 static int rot_of(int view) { return view == V_PORTRAIT ? 0 : view <= V_DUAL_L ? 1 : 2; }
 static int is_dual(int view) { return view == V_DUAL_L || view == V_DUAL_R; }
+
+// D-pad keys as the viewer sees them for a specific view. Taking the view as
+// an argument avoids depending on the mutable drawing rotation (g_rot), which
+// is what made a rotation change able to leak into the next page-turn input.
+static void vkeys(int view, u32 *l, u32 *r, u32 *u, u32 *d) {
+    int rot = rot_of(view);
+    if (rot == 0)      { *l = KEY_LEFT; *r = KEY_RIGHT; *u = KEY_UP;   *d = KEY_DOWN; }
+    else if (rot == 1) { *l = KEY_UP;   *r = KEY_DOWN;  *u = KEY_RIGHT; *d = KEY_LEFT; }
+    else               { *l = KEY_DOWN; *r = KEY_UP;    *u = KEY_LEFT;  *d = KEY_RIGHT; }
+}
+
+// One directional decision for both page turns and tests. Viewer-left means
+// "next" when reading right-to-left; dual-page view advances by a spread.
+static int dpad_step(int view, int rtl, u32 dn) {
+    u32 l, r, u, d;
+    vkeys(view, &l, &r, &u, &d);
+    int step = 0;
+    if (dn & (rtl ? l : r)) step = 1;
+    if (dn & (rtl ? r : l)) step = -1;
+    return is_dual(view) ? step * 2 : step;
+}
 
 // Width of the image window actually shown by this view. Decode targets come
 // from this, not from a fixed 384*f: portrait was decoding 1.5x too wide.
@@ -1004,7 +1171,7 @@ static void reader(Book *b, const char *path, int start) {
     int page = start < 0 ? 0 : start >= n ? n - 1 : start;
     g_curpage = page;
     int view = cfg.view, rtl = cfg.rtl, f = 1, ox = 0, oy = 0, dirty = 1, turns = 0, tx = -1, ty = -1;
-    int page_changed = 0, turn_dir = 1, prefetch_pending = 1, combo_latch = 0;
+    int page_changed = 0, turn_dir = 1, prefetch_pending = 1, combo_latch = 0, overlay_latch = 0;
     u32 combo_pending = 0;
     int combo_wait = 0;
     b->npages = n;
@@ -1034,15 +1201,18 @@ static void reader(Book *b, const char *path, int start) {
         u32 dn = keysDown() | g_pend, hd = keysHeld(), kl, kr, ku, kd;
         g_pend = 0;
         u32 combo = KEY_L | KEY_A | KEY_DOWN;
+        u32 overlay = KEY_L | KEY_UP;
 
         // L, A and DOWN all have normal reader actions. The shortcut is
         // L -> A -> DOWN in practice, so defer L, and defer A/DOWN only while
-        // they are part of that prefix. A page turn or DOWN pan on its own is
-        // therefore never delayed; a sequential chord cannot leak actions.
+        // they are part of that prefix. L+UP is handled the same way so its
+        // UP press cannot change the hinge gap first. UP on its own stays
+        // immediate, preserving scrolling/panning responsiveness.
         u32 defer = 0;
         if (dn & KEY_L) defer |= KEY_L;
         if ((dn & KEY_A) && ((hd | combo_pending) & KEY_L)) defer |= KEY_A;
         if ((dn & KEY_DOWN) && ((hd | combo_pending) & (KEY_L | KEY_A))) defer |= KEY_DOWN;
+        if ((dn & KEY_UP) && ((hd | combo_pending) & KEY_L)) defer |= KEY_UP;
         if (defer) {
             combo_pending |= defer;
             combo_wait = 2;
@@ -1055,10 +1225,22 @@ static void reader(Book *b, const char *path, int start) {
                 dirty = 1;
                 music_dirty = 1;
             }
+            overlay_latch = 0;
             combo_pending = 0; combo_wait = 0;
             dn = 0; hd = 0;                 // never turn/rotate on L+A+DOWN
+        } else if ((hd & overlay) == overlay) {
+            if (!overlay_latch) {
+                overlay_latch = 1;
+                music_overlay_on ^= 1;
+                dirty = 1;                  // page redraw also clears the old overlay
+                music_dirty = 1;
+            }
+            combo_latch = 0;
+            combo_pending = 0; combo_wait = 0;
+            dn = 0; hd = 0;                 // never rotate or change the gap on L+UP
         } else {
             combo_latch = 0;
+            overlay_latch = 0;
             if (combo_pending) {
                 if (combo_wait) combo_wait--;
                 else { dn |= combo_pending; combo_pending = 0; }
@@ -1071,14 +1253,14 @@ static void reader(Book *b, const char *path, int start) {
         audio_pump(4);
         if (music_notice_tick()) dirty = 1;
         g_rot = rot_of(view);                                  // after the view may have changed
-        vkeys(&kl, &kr, &ku, &kd);
+        vkeys(view, &kl, &kr, &ku, &kd);
         int dual = is_dual(view), step = 0, pan0 = rtl ? 1 << 20 : 0;
 
         if (dn & KEY_A) step = dual ? 2 : 1;
         if (dn & KEY_B) step = dual ? -2 : -1;
         if (dual || f == 1) {
-            if (dn & kl) step = rtl ? 1 : -1;
-            if (dn & kr) step = rtl ? -1 : 1;
+            int ds = dpad_step(view, rtl, dn);
+            if (ds) step = ds;
             if (dn & (ku | kd)) {                              // hinge gap: up = more, down = less
                 cfg.gap += (dn & ku) ? 4 : -4;
                 if (cfg.gap < 0) cfg.gap = 0;
@@ -1165,7 +1347,11 @@ static void reader(Book *b, const char *path, int start) {
             up_start(&pdf, page, target, f > 1 ? g_hi : g_slot);
         }
         if (g_up.active) {
-            if (up_step()) dirty = 1;                          // better image is ready
+            // Do not steal frames from an active pan/page turn. Decode more
+            // aggressively only on truly idle frames (which is still a
+            // bounded chunk); this keeps scrolling responsive while making
+            // the staged resolution upgrades finish sooner.
+            if (!hd && !dn && up_step(1)) dirty = 1;
             busy();
             decode_progress();
         } else if (!hd && !dn && !prefetch_pending) {           // idle: fast previews only

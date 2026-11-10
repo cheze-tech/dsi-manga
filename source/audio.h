@@ -15,6 +15,7 @@ int  audio_current_index(void);    // selected/playing index, or -1
 int  audio_next_index(void);       // planned shuffled next index, or -1
 const char *audio_next_title(void);// file name of the planned next track, or NULL
 unsigned audio_track_serial(void); // increments whenever a new track actually opens
+const char *audio_music_dir(void); // directory containing the detected tracks
 
 // shuffle bag, exposed so it can be tested on a PC
 void audio_shuffle_reset(int n);

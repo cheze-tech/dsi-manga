@@ -21,6 +21,10 @@ ENHANCED  (source/enhanced.c)  for DSi mode / 16 MB RAM:
   * page turns: the upcoming page's cheap preview is filled before the current page's
     multi-second detail decode, so the next turn does not wait for a JPEG decode. The
     short bar at the top of the top screen shows current-page detail progress.
+    Detail upgrades are staged: a faster intermediate scale is shown before the final
+    scale, and final quality is unchanged. Detail work pauses while the user is
+    panning/turning so scrolling keeps priority, then resumes when input stops. Very
+    large source images are not decoded beyond twice the pixels the display can use.
   * library: cover grid (first page), green progress bar per book, sorted by last opened,
     A resumes at the saved page, B starts at page 1. Saved in <folder>/dsimanga.lib,
     covers cached next to each PDF as <name>.pdf.thm
@@ -58,7 +62,13 @@ MUSIC
   with NOW / NEXT (and PAUSED while paused); an empty /mp3 folder shows
   "No MP3s in /mp3". Every new track also shows a temporary NOW PLAYING banner
   near the top of the reader for about three seconds; the compact NOW / NEXT
-  overlay remains, and the banner does not restart on page redraws.
+  overlay remains, and the banner does not restart on page redraws. L+UP toggles
+  the compact overlay on/off (default on); the temporary new-track banner is
+  independent and always remains enabled.
+  The music menu shows embedded ID3 APIC/PIC JPEG artwork when available, cached
+  for the current track. Missing, unsupported, corrupt or oversized artwork shows
+  a NO ART placeholder. Artwork decoding is limited to the menu and does not run
+  during reader scrolling or page decoding.
   L+A+DOWN in the reader opens the music menu, where the list of detected tracks,
   the current track, the planned next track, manual selection, pause/resume and
   next-track controls are available. In the menu, A plays the selected track,
@@ -77,9 +87,10 @@ SLEEP (DSi edition)
 CONTROLS
   Library: D-pad move, A resume, B from page 1, X quality, START quit
            SELECT next song, Y pause/resume music
-  Reader:  A/R next, B/L prev, D-pad left/right turn (dual: single page shift),
+  Reader:  A/R next, B/L prev, D-pad left/right turn (dual: two-page step),
            Y reading direction (starts right-to-left), X zoom 1x-4x, SELECT view,
-           L+A+DOWN music menu, zoomed: D-pad / touch-drag pan, START back to library
+           L+A+DOWN music menu, L+UP show/hide music overlay,
+           zoomed: D-pad / touch-drag pan, START back to library
            Green line along the bottom of the lower screen = reading progress
   Red square top-right = decoding. Blue strip at the top = current-page detail
   progress. Red screen = page can't be decoded (progressive JPEG etc).
@@ -88,4 +99,6 @@ CONTROLS
 
 HOST TESTS (no DSi needed)
   gcc -O1 -o test_pdf tools/test_pdf.c source/pdf.c && python3 tools/gen_test_pdfs.py ./test_pdf
-  gcc -O1 -Itools/stubs -Isource -o render_test tools/render_test.c source/pdf.c tools/stubs/stubs.c
+  gcc -O1 -Isource -o id3art_test tools/id3art_test.c source/id3art.c && ./id3art_test
+  gcc -O1 -Itools/stubs -Isource -o dir_test tools/dir_test.c source/pdf.c source/id3art.c tools/stubs/stubs.c && ./dir_test
+  gcc -O1 -Itools/stubs -Isource -o render_test tools/render_test.c source/pdf.c source/id3art.c tools/stubs/stubs.c && ./render_test

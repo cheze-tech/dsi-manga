@@ -39,7 +39,7 @@ dsi: dsimanga_dsi.nds
 
 dsimanga.elf: $(COMMON) source/main.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lfat -lnds9 -lcalico_ds9 -o $@
-dsimanga_dsi.elf: $(COMMON) source/enhanced.c source/audio.c
+dsimanga_dsi.elf: $(COMMON) source/enhanced.c source/audio.c source/id3art.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(AUDIO_LIBS) -lfat -lnds9 -lcalico_ds9 -o $@
 
 ifeq ($(AUDIO),1)

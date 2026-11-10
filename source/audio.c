@@ -10,6 +10,8 @@
 #define MP3_DIR "/mp3/"
 #endif
 
+const char *audio_music_dir(void) { return MP3_DIR; }
+
 // ---- shuffle bag: every track once per round, never the same track twice in a row ----
 static int *bag, bag_n, bag_pos, last_track = -1;
 
