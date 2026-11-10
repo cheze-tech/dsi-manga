@@ -50,7 +50,18 @@ static void mkfile(const char *name, int frames, int rate_code) {
     for (int i = 0; i < frames; i++) { unsigned char fr[FRAME_BYTES] = { 0xFF, (unsigned char)rate_code }; fwrite(fr, 1, FRAME_BYTES, f); }
     fclose(f);
 }
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "empty")) {
+        mkdir(MP3_DIR, 0777);
+        audio_init();
+        assert(audio_count() == 0);
+        assert(audio_title() == NULL && audio_next_title() == NULL);
+        assert(audio_name(0) == NULL && audio_current_index() == -1);
+        assert(!audio_select(0) && audio_next_index() == -1);
+        audio_toggle(); audio_next(); audio_pump(4);
+        puts("empty folder: OK");
+        return 0;
+    }
     mkdir("/tmp/simmp3", 0777);
     mkfile("a.mp3", 30, 0); mkfile("b.MP3", 30, 0); mkfile("c.mp3", 30, 1);
     FILE *f = fopen("/tmp/simmp3/notes.txt", "w"); fputs("ignore me", f); fclose(f);
@@ -86,6 +97,40 @@ int main(void) {
     audio_toggle(); for (int t = 0; t < 30; t++) tick();
     printf("paused: %ld real samples during 1 s of pause (expect 0); after resume: %ld\n", during, played - p0 - during);
     assert(during == 0 && played - p0 > 0);
+
+    // 3) playlist state, manual selection, and the planned next track
+    int count = audio_count();
+    assert(count == 3);
+    assert(audio_name(0) && audio_name(1) && audio_name(2));
+    assert(audio_name(-1) == NULL && audio_name(3) == NULL);
+    int cur = audio_current_index();
+    assert(cur >= 0 && cur < count);
+    int nxt = audio_next_index();
+    assert(nxt >= 0 && nxt < count && nxt != cur);
+    assert(audio_next_title() && strcmp(audio_next_title(), audio_title()) != 0);
+
+    int pick = (cur + 1) % count;
+    assert(audio_select(pick));
+    assert(audio_current_index() == pick);
+    assert(strcmp(audio_title(), audio_name(pick)) == 0);
+    assert(audio_next_index() >= 0 && audio_next_index() != pick);
+    assert(audio_next_title() && strcmp(audio_next_title(), audio_title()) != 0);
+    audio_toggle(); assert(audio_paused());
+    assert(audio_select(pick)); assert(!audio_paused());
+
+    const char *planned = audio_next_title();
+    int planned_i = audio_next_index();
+    audio_next();
+    assert(audio_current_index() == planned_i);
+    assert(strcmp(audio_title(), planned) == 0);
+    assert(audio_next_index() >= 0 && audio_next_index() != planned_i);
+    printf("manual select/next: %s -> %s -> %s\n", audio_name(pick), planned, audio_next_title());
+    for (int i = 0; i < count; i++) {              // every manual choice must not repeat immediately
+        assert(audio_select(i));
+        assert(audio_current_index() == i);
+        assert(audio_next_index() >= 0 && audio_next_index() != i);
+    }
+    assert(!audio_select(-1) && !audio_select(count));
     puts("audio logic OK");
     return 0;
 }

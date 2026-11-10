@@ -32,6 +32,25 @@ int audio_shuffle_next(void) {
     return last_track = bag[bag_pos++];
 }
 
+// Pick the next shuffled track, but never pick `avoid` again immediately.
+// This matters after a manual selection: the current track may still be sitting
+// at the front of the shuffle bag.
+static int shuffle_next_avoid(int avoid) {
+    int i = audio_shuffle_next();
+    if (i != avoid || bag_n <= 1 || bag_pos <= 0) return i;
+    for (int k = 0; k < bag_n; k++) {
+        if (bag[k] != avoid) {
+            int t = bag[bag_pos - 1];
+            bag[bag_pos - 1] = bag[k];
+            bag[k] = t;
+            i = bag[bag_pos - 1];
+            break;
+        }
+    }
+    last_track = i;
+    return i;
+}
+
 #ifdef USE_AUDIO
 #include <nds.h>
 #include <maxmod9.h>
@@ -48,6 +67,7 @@ static s16 *ring;
 static unsigned rd, wr, cnt;
 static char **names;
 static int nnames, ready, paused, cur_rate, stream_open;
+static int cur_track = -1, next_track = -1;
 static const char *title;
 static FILE *mp;
 static struct mad_stream ms;
@@ -88,16 +108,31 @@ static void close_file(void) {
     mp = NULL;
 }
 
+static int open_track(int i) {
+    if (i < 0 || i >= nnames) return 0;
+    char p[300];
+    snprintf(p, sizeof p, MP3_DIR "%s", names[i]);
+    if (!(mp = fopen(p, "rb"))) return 0;
+    mad_stream_init(&ms); mad_frame_init(&mf); mad_synth_init(&msy);
+    title = names[i];
+    cur_track = i;
+    return 1;
+}
+
+static void plan_next(void) {
+    next_track = shuffle_next_avoid(cur_track);
+}
+
 static int open_next(void) {
     for (int tries = 0; tries < nnames; tries++) {
-        int i = audio_shuffle_next();
+        int i = next_track;
+        next_track = -1;
+        if (i < 0) i = audio_shuffle_next();
         if (i < 0) return 0;
-        char p[300];
-        snprintf(p, sizeof p, MP3_DIR "%s", names[i]);
-        if (!(mp = fopen(p, "rb"))) continue;
-        mad_stream_init(&ms); mad_frame_init(&mf); mad_synth_init(&msy);
-        title = names[i];
-        return 1;
+        if (open_track(i)) {
+            plan_next();
+            return 1;
+        }
     }
     return 0;
 }
@@ -155,9 +190,29 @@ void audio_next(void) {
     audio_pump(2);
 }
 
+int audio_select(int i) {
+    if (!ready || i < 0 || i >= nnames) return 0;
+    close_file();
+    rd = wr = cnt = 0;
+    paused = 0;
+    cur_track = -1;
+    next_track = -1;
+    title = NULL;
+    if (!open_track(i)) { audio_pump(2); return 0; }
+    last_track = i;
+    plan_next();
+    audio_pump(2);
+    return 1;
+}
+
 void audio_toggle(void) { if (ready) paused ^= 1; }
 int audio_paused(void) { return paused; }
 const char *audio_title(void) { return ready ? title : NULL; }
+int audio_count(void) { return nnames; }
+const char *audio_name(int i) { return i >= 0 && i < nnames ? names[i] : NULL; }
+int audio_current_index(void) { return ready ? cur_track : -1; }
+int audio_next_index(void) { return ready && next_track >= 0 ? next_track : -1; }
+const char *audio_next_title(void) { int i = audio_next_index(); return i >= 0 ? names[i] : NULL; }
 
 void audio_init(void) {
     DIR *d = opendir(MP3_DIR);
@@ -180,6 +235,8 @@ void audio_init(void) {
     mmInit(&sys);
     srand((unsigned)time(NULL));
     audio_shuffle_reset(nnames);
+    cur_track = next_track = -1;
+    title = NULL;
     ready = 1;
     audio_pump(2);
 }
@@ -189,7 +246,13 @@ void audio_init(void) {
 void audio_init(void) {}
 void audio_pump(int max_frames) { (void)max_frames; }
 void audio_next(void) {}
+int audio_select(int i) { (void)i; return 0; }
 void audio_toggle(void) {}
 int audio_paused(void) { return 0; }
 const char *audio_title(void) { return NULL; }
+int audio_count(void) { return 0; }
+const char *audio_name(int i) { (void)i; return NULL; }
+int audio_current_index(void) { return -1; }
+int audio_next_index(void) { return -1; }
+const char *audio_next_title(void) { return NULL; }
 #endif

@@ -54,9 +54,13 @@ IS IT REALLY USING 16 MB?
 
 MUSIC
   Put MP3 files in /mp3. The DSi edition plays them shuffled by default and shows
-  the current file name in the library. Library: SELECT next, Y pause/resume.
-  Reader: SELECT next. Empty folders and unsupported files are skipped; if no
-  track can be decoded the music line disappears and reading continues normally.
+  the current file name in the library. The reader has a compact top-left overlay
+  with NOW / NEXT (and PAUSED while paused); an empty /mp3 folder shows
+  "No MP3s in /mp3". L+R+A in the reader opens the music menu, where the list of
+  detected tracks, the current track, the planned next track, manual selection,
+  pause/resume and next-track controls are available. B closes the menu and music
+  keeps playing. Empty folders and unsupported files are skipped; if no track can
+  be decoded the overlay shows that music is unavailable and reading continues.
   MP3s are decoded on ARM9 by libmad; Maxmod feeds the DS sound hardware.
 
 CONTROLS
@@ -64,10 +68,11 @@ CONTROLS
            SELECT next song, Y pause/resume music
   Reader:  A/R next, B/L prev, D-pad left/right turn (dual: single page shift),
            Y reading direction (starts right-to-left), X zoom 1x-4x, SELECT view,
-           zoomed: D-pad / touch-drag pan, START back to library
+           L+R+A music menu, zoomed: D-pad / touch-drag pan, START back to library
            Green line along the bottom of the lower screen = reading progress
   Red square top-right = decoding. Blue strip at the top = current-page detail
   progress. Red screen = page can't be decoded (progressive JPEG etc).
+  Music overlay top-left = NOW / NEXT, or PAUSED while paused.
 
 HOST TESTS (no DSi needed)
   gcc -O1 -o test_pdf tools/test_pdf.c source/pdf.c && python3 tools/gen_test_pdfs.py ./test_pdf

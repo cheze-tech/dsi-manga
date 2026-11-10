@@ -5,7 +5,8 @@
 // Reader
 //   A next   B prev   D-pad left/right = turn (reading direction)
 //   R / L = rotate view forward / back   Y flip reading direction   X zoom (1x..4x)
-//   SELECT = next song   START library        (.txt files: A/R/L/B/D-pad turn pages)
+//   SELECT = next song   L+R+A = music menu   START library
+//   (.txt files: A/R/L/B/D-pad turn pages)
 //   Views: PORTRAIT (one page over both screens) -> SPREAD (one wide page over both
 //   screens, console held sideways) -> DUAL (two pages, one per screen, held sideways)
 //   Zoomed: D-pad or touch-drag pans.  The green line at the bottom is progress.
@@ -569,6 +570,207 @@ static void decode_progress(void) {
     }
 }
 
+// ---- music UI --------------------------------------------------------------
+// libnds keeps an 8x8, one-bit-per-pixel console font in ROM. Using it avoids
+// adding another font table and uses no heap.
+extern const unsigned char default_font_bin[];
+#define MUSIC_TOP 18
+#define MUSIC_ROW 9
+#define MUSIC_ROWS ((192 - MUSIC_TOP) / MUSIC_ROW)
+#define MUSIC_STATUS_W 176
+#define MUSIC_STATUS_H 18
+static int music_dirty = 1;
+
+static inline u16 ui_col(int r, int g, int b) { return RGB15(r, g, b) | BIT(15); }
+
+static void ui_rect(u16 *s, int x, int y, int w, int h, u16 c) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > 256) w = 256 - x;
+    if (y + h > 192) h = 192 - y;
+    if (!s || w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++) {
+        u16 *row = s + (y + j) * 256 + x;
+        for (int i = 0; i < w; i++) row[i] = c;
+    }
+}
+
+// One character is 8x8. The glyph rows use bit 0 as the leftmost pixel.
+static void ui_text(u16 *s, int x, int y, const char *t, u16 c, int max) {
+    if (!s || !t) return;
+    for (int i = 0; t[i] && (max < 0 || i < max); i++) {
+        int gx = x + i * 8;
+        if (gx < 0 || gx > 248) break;
+        unsigned char ch = (unsigned char)t[i];
+        if (ch < 32 || ch > 126) ch = '?';
+        const unsigned char *g = default_font_bin + ch * 8;
+        for (int row = 0; row < 8; row++) {
+            int yy = y + row;
+            if (yy < 0 || yy >= 192) continue;
+            u16 *p = s + yy * 256 + gx;
+            unsigned char bits = g[row];
+            for (int b = 0; b < 8; b++) if (bits & (1 << b)) p[b] = c;
+        }
+    }
+}
+
+static void ui_fit(char *out, size_t n, const char *s, int max) {
+    if (!n) return;
+    if (max > (int)n - 1) max = (int)n - 1;
+    if (max < 0) max = 0;
+    int o = 0;
+    for (; s && s[o] && o < max; o++) {
+        unsigned char c = (unsigned char)s[o];
+        out[o] = (c >= 32 && c < 127) ? (char)c : '?';
+    }
+    if (s && s[o] && max >= 3) {
+        out[max - 3] = '.'; out[max - 2] = '.'; out[max - 1] = '.';
+        o = max;
+    }
+    out[o] = 0;
+}
+
+static void ui_label(char *out, size_t n, const char *label, const char *value, int max) {
+    char tmp[80];
+    snprintf(tmp, sizeof tmp, "%s %s", label, value ? value : "-");
+    ui_fit(out, n, tmp, max);
+}
+
+// Compact top-left overlay. It stays out of the decode strip (x=186) and the
+// busy square (x=250), and never gets larger than two short lines.
+static void music_status_draw(void) {
+    if (!scr[0]) return;
+    const char *title = audio_title();
+    if (!title) {
+        if (audio_count() == 0) {
+            ui_rect(scr[0], 0, 0, 136, 10, ui_col(1, 1, 3));
+            ui_text(scr[0], 2, 1, "No MP3s in /mp3", ui_col(18, 18, 22), 16);
+        } else {
+            ui_rect(scr[0], 0, 0, 144, 10, ui_col(1, 1, 3));
+            ui_text(scr[0], 2, 1, "Music unavailable", ui_col(28, 18, 0), 17);
+        }
+        return;
+    }
+    char line[40];
+    ui_rect(scr[0], 0, 0, MUSIC_STATUS_W, MUSIC_STATUS_H, ui_col(1, 1, 3));
+    ui_label(line, sizeof line, audio_paused() ? "PAUSED" : "NOW", title, 21);
+    ui_text(scr[0], 2, 1, line, audio_paused() ? ui_col(31, 24, 0) : ui_col(18, 28, 31), 21);
+    ui_label(line, sizeof line, "NEXT", audio_next_title(), 21);
+    ui_text(scr[0], 2, 10, line, ui_col(20, 20, 24), 21);
+}
+
+static void music_status_check(void) {
+    static const char *last_title, *last_next;
+    static int last_paused = -1, last_count = -1, started;
+    const char *title = audio_title(), *next = audio_next_title();
+    int paused = audio_paused(), count = audio_count();
+    if (!started || title != last_title || next != last_next ||
+        paused != last_paused || count != last_count) {
+        started = 1;
+        last_title = title; last_next = next;
+        last_paused = paused; last_count = count;
+        music_dirty = 1;
+    }
+}
+
+static void draw_music_menu(int sel, int *first) {
+    int n = audio_count();
+    int cur = audio_current_index();
+    if (n <= 0) { sel = 0; *first = 0; }
+    if (sel < 0) sel = 0;
+    if (n && sel >= n) sel = n - 1;
+    if (n) {
+        if (sel < *first) *first = sel;
+        if (sel >= *first + MUSIC_ROWS) *first = sel - MUSIC_ROWS + 1;
+    }
+
+    ui_rect(scr[0], 0, 0, 256, 192, ui_col(1, 1, 3));
+    ui_rect(scr[0], 0, 0, 256, 18, ui_col(3, 5, 12));
+    ui_text(scr[0], 4, 5, "MUSIC", ui_col(18, 28, 31), -1);
+    char pos[16];
+    snprintf(pos, sizeof pos, "%d/%d", n ? sel + 1 : 0, n);
+    ui_text(scr[0], 196, 5, pos, ui_col(18, 18, 24), 7);
+
+    if (!n) {
+        ui_text(scr[0], 8, 42, "No MP3 files found", ui_col(31, 24, 0), -1);
+        ui_text(scr[0], 8, 60, "Put .mp3 files in /mp3", ui_col(22, 22, 28), -1);
+    } else {
+        for (int row = 0; row < MUSIC_ROWS; row++) {
+            int i = *first + row;
+            if (i >= n) break;
+            int y = MUSIC_TOP + row * MUSIC_ROW;
+            if (i == sel) ui_rect(scr[0], 0, y, 256, MUSIC_ROW, ui_col(7, 15, 24));
+            char raw[96], line[40];
+            const char *name = audio_name(i);
+            snprintf(raw, sizeof raw, "%c%3d %s", i == cur ? '*' : ' ', i + 1, name ? name : "?");
+            ui_fit(line, sizeof line, raw, 31);
+            ui_text(scr[0], 4, y + 1, line,
+                    i == cur ? ui_col(8, 31, 12) :
+                    i == sel ? ui_col(31, 31, 31) : ui_col(20, 20, 26), 31);
+        }
+    }
+
+    ui_rect(scr[1], 0, 0, 256, 192, ui_col(1, 1, 3));
+    ui_rect(scr[1], 0, 0, 256, 18, ui_col(3, 5, 12));
+    ui_text(scr[1], 4, 5, "NOW PLAYING", ui_col(18, 28, 31), -1);
+    char line[40];
+    ui_fit(line, sizeof line, audio_title() ? audio_title() : "No music", 31);
+    ui_text(scr[1], 4, 25, line, ui_col(31, 31, 31), 31);
+    ui_text(scr[1], 4, 45, "NEXT UP", ui_col(18, 28, 31), -1);
+    ui_fit(line, sizeof line, audio_next_title() ? audio_next_title() : "-", 31);
+    ui_text(scr[1], 4, 55, line, ui_col(24, 24, 28), 31);
+    ui_text(scr[1], 4, 75, audio_paused() ? "PAUSED" : "PLAYING",
+            audio_paused() ? ui_col(31, 24, 0) : ui_col(8, 31, 12), -1);
+
+    ui_text(scr[1], 4, 100, "A  play selected", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 112, "Y  pause / resume", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 124, "R  next track", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 136, "B  close menu", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 148, "D-pad  browse list", ui_col(24, 24, 28), -1);
+    ui_text(scr[1], 4, 168, "Music continues while open", ui_col(14, 18, 22), -1);
+}
+
+static void music_menu(void) {
+    int n = audio_count();
+    int sel = n ? audio_current_index() : 0;
+    if (sel < 0) sel = 0;
+    int first = 0, redraw = 1, repeat = 0, dir = 0;
+    const char *shown_title = audio_title(), *shown_next = audio_next_title();
+    int shown_paused = audio_paused();
+    for (;;) {
+        if (redraw) { draw_music_menu(sel, &first); redraw = 0; }
+        swiWaitForVBlank();
+        scanKeys();
+        audio_pump(4);
+        if (audio_title() != shown_title || audio_next_title() != shown_next ||
+            audio_paused() != shown_paused) {
+            shown_title = audio_title(); shown_next = audio_next_title();
+            shown_paused = audio_paused();
+            redraw = 1;
+        }
+        u32 dn = keysDown(), hd = keysHeld();
+        if (dn & (KEY_B | KEY_START)) break;
+
+        int moved = 0;
+        if (dn & KEY_UP) { if (sel > 0) sel--; moved = 1; dir = -1; repeat = 0; }
+        else if (dn & KEY_DOWN) { if (sel + 1 < n) sel++; moved = 1; dir = 1; repeat = 0; }
+        else if ((hd & (KEY_UP | KEY_DOWN)) && dir) {
+            if (++repeat >= 8) {
+                if (dir < 0 && sel > 0) sel--;
+                if (dir > 0 && sel + 1 < n) sel++;
+                repeat = 0; moved = 1;
+            }
+        } else { dir = 0; repeat = 0; }
+
+        if ((dn & KEY_A) && n) { audio_select(sel); redraw = 1; }
+        if (dn & KEY_Y) { audio_toggle(); redraw = 1; }
+        if (dn & KEY_R) { audio_next(); redraw = 1; }
+        if (dn & KEY_LEFT && n) { sel = sel >= 10 ? sel - 10 : 0; redraw = 1; }
+        if (dn & KEY_RIGHT && n) { sel = sel + 10 < n ? sel + 10 : n - 1; redraw = 1; }
+        if (moved) redraw = 1;
+    }
+}
+
 // d-pad keys as the viewer sees them for the current orientation
 static void vkeys(u32 *l, u32 *r, u32 *u, u32 *d) {
     if (g_rot == 0)      { *l = KEY_LEFT; *r = KEY_RIGHT; *u = KEY_UP;   *d = KEY_DOWN; }
@@ -734,7 +936,7 @@ static void reader(Book *b, const char *path, int start) {
     int page = start < 0 ? 0 : start >= n ? n - 1 : start;
     g_curpage = page;
     int view = cfg.view, rtl = cfg.rtl, f = 1, ox = 0, oy = 0, dirty = 1, turns = 0, tx = -1, ty = -1;
-    int page_changed = 0, turn_dir = 1, prefetch_pending = 1;
+    int page_changed = 0, turn_dir = 1, prefetch_pending = 1, combo_latch = 0;
     b->npages = n;
     // Small books: current + 2 back + 2 ahead in RAM. Large books: current + 1 each way.
     g_nslot = pdf.size < (5u << 20) ? g_maxslot : (g_maxslot >= 5 ? 3 : g_maxslot);
@@ -752,6 +954,7 @@ static void reader(Book *b, const char *path, int start) {
         cache[i].hi = 0; cache[i].bytes = 0;
     }
     gfx_reader();
+    music_dirty = 1;
     touchPosition tp;
 
     for (;;) {
@@ -759,6 +962,16 @@ static void reader(Book *b, const char *path, int start) {
         scanKeys();
         u32 dn = keysDown() | g_pend, hd = keysHeld(), kl, kr, ku, kd;
         g_pend = 0;
+        u32 combo = KEY_L | KEY_R | KEY_A;
+        if ((hd & combo) == combo) {
+            if (!combo_latch) {
+                combo_latch = 1;
+                music_menu();
+                dirty = 1;
+                music_dirty = 1;
+            }
+            dn = 0; hd = 0;                 // never turn/rotate on L+R+A
+        } else combo_latch = 0;
         if (dn & KEY_START) break;
         int vd = ((dn & KEY_R) ? 1 : 0) - ((dn & KEY_L) ? 1 : 0);          // R rotate forward, L back
         if (vd) { view = (view + V_COUNT + vd) % V_COUNT; f = 1; oy = 0; ox = rtl ? 1 << 20 : 0; dirty = 1; }
@@ -837,6 +1050,7 @@ static void reader(Book *b, const char *path, int start) {
             }
             draw_view(view, page, n, rtl, f, &ox, &oy, bad);
             progress_line(page, n);
+            music_dirty = 1;
         }
 
         // The immediately upcoming page is more valuable than a sharper current
@@ -875,6 +1089,8 @@ static void reader(Book *b, const char *path, int start) {
                     !bad[c] && !cached(c)) { load_detail(&pdf, c, bad, pv, g_slot, 1, NULL); break; }
             }
         }
+        music_status_check();
+        if (music_dirty) { music_status_draw(); music_dirty = 0; }
     }
     cfg.view = view; cfg.rtl = rtl;
     b->page = page;
