@@ -29,14 +29,18 @@ BUILD
      (enhanced.c reads jd.ncomp from the JDEC struct to detect grayscale JPEGs.)
   3. make        -> dsimanga.nds        make dsi  -> dsimanga_dsi.nds
   Put the .nds on the SD card, PDFs in /manga.
+  The DSi build uses high title ID 00030000 (DSi-enhanced gamecard). Do not
+  change it to 00030004: that is a DSiWare title ID and cannot be launched as
+  a .nds card; melonDS can crash at boot with it.
 
 IS IT REALLY USING 16 MB?
   The library screen prints "DSi 12MB" (largest block it could allocate) plus the
   KB budget per cached page and the peak cache RAM of the last book. If it says
-  "DS 3MB" the app is running in DS mode or libnds gave it the small heap. Things to try:
-  the DSIFLAGS in the Makefile, TWiLight Menu++'s per-app "run in DSi mode" setting,
-  or a different linker spec (make dsi SPECS=...). The app still works either way - it
-  just decodes at lower resolution when memory is short.
+  "DS 3MB" the app is running in DS mode or libnds gave it the small heap. Check
+  that melonDS has DSi BIOS/firmware configured and DSi mode enabled, or use
+  TWiLight Menu++'s per-app "run in DSi mode" setting. You can also try a different
+  linker spec (make dsi SPECS=...). The app still works either way - it just decodes
+  at lower resolution when memory is short.
 
 CONTROLS
   Library: D-pad move, A resume, B from page 1, X quality, Y console hold side, START quit
