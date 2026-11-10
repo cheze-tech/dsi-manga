@@ -3,6 +3,8 @@
 #include "fat.h"
 JRESULT jd_prepare(JDEC*a, size_t(*b)(JDEC*,uint8_t*,size_t), void*c, size_t d, void*e){return JDR_FMT3;}
 JRESULT jd_decomp(JDEC*a, int(*b)(JDEC*,void*,JRECT*), uint8_t c){return JDR_FMT3;}
+JRESULT jd_decomp_begin(JDEC*a, int(*b)(JDEC*,void*,JRECT*), uint8_t c){return JDR_FMT3;}
+JRESULT jd_decomp_step(JDEC*a, int(*b)(JDEC*,void*,JRECT*), unsigned int d){return JDR_FMT3;}
 void scanKeys(void){} u32 keysDown(void){return 0;} u32 keysHeld(void){return 0;} void touchRead(touchPosition*t){}
 void consoleDemoInit(void){} void consoleClear(void){} int fatInitDefault(void){return 1;}
 void swiWaitForVBlank(void){} void videoSetMode(int a){} void videoSetModeSub(int a){}

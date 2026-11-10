@@ -1115,39 +1115,67 @@ JRESULT jd_prepare (
 /* Start to decompress the JPEG picture                                  */
 /*-----------------------------------------------------------------------*/
 
+JRESULT jd_decomp_begin (
+	JDEC* jd,								/* Initialized decompression object */
+	int (*outfunc)(JDEC*, void*, JRECT*),	/* RGB output function */
+	uint8_t scale							/* Output de-scaling factor (0 to 3) */
+)
+{
+	(void)outfunc;
+	if (scale > (JD_USE_SCALE ? 3 : 0)) return JDR_PAR;
+	jd->scale = scale;
+	jd->dcv[2] = jd->dcv[1] = jd->dcv[0] = 0;   /* Initialize DC values */
+	jd->rst = jd->rsc = 0;
+	jd->x = jd->y = 0;
+	jd->started = 1;
+	return JDR_OK;
+}
+
+/* Decode up to max_mcus MCUs, preserving all decoder state. Returns JDR_MORE
+/ when the budget is reached, JDR_OK when the image is complete, or an error.
+/ The output function returning 0 aborts the decode. */
+JRESULT jd_decomp_step (
+	JDEC* jd,								/* Initialized decompression object */
+	int (*outfunc)(JDEC*, void*, JRECT*),	/* RGB output function */
+	unsigned int max_mcus					/* MCU budget for this call */
+)
+{
+	unsigned int mx, my, n = 0;
+	JRESULT rc;
+
+	if (!jd->started) return JDR_PAR;
+	mx = jd->msx * 8; my = jd->msy * 8;
+
+	for (; jd->y < jd->height; jd->y += my) {
+		for (; jd->x < jd->width; jd->x += mx) {
+			if (n >= max_mcus) return JDR_MORE;
+			if (jd->nrst && jd->rst++ == jd->nrst) {
+				rc = restart(jd, jd->rsc++);
+				if (rc != JDR_OK) { jd->started = 0; return rc; }
+				jd->rst = 1;
+			}
+			rc = mcu_load(jd);
+			if (rc != JDR_OK) { jd->started = 0; return rc; }
+			rc = mcu_output(jd, outfunc, jd->x, jd->y);
+			if (rc != JDR_OK) { jd->started = 0; return rc; }
+			n++;
+		}
+		jd->x = 0;
+	}
+	jd->started = 0;
+	return JDR_OK;
+}
+
 JRESULT jd_decomp (
 	JDEC* jd,								/* Initialized decompression object */
 	int (*outfunc)(JDEC*, void*, JRECT*),	/* RGB output function */
 	uint8_t scale							/* Output de-scaling factor (0 to 3) */
 )
 {
-	unsigned int x, y, mx, my;
-	uint16_t rst, rsc;
-	JRESULT rc;
-
-
-	if (scale > (JD_USE_SCALE ? 3 : 0)) return JDR_PAR;
-	jd->scale = scale;
-
-	mx = jd->msx * 8; my = jd->msy * 8;			/* Size of the MCU (pixel) */
-
-	jd->dcv[2] = jd->dcv[1] = jd->dcv[0] = 0;	/* Initialize DC values */
-	rst = rsc = 0;
-
-	rc = JDR_OK;
-	for (y = 0; y < jd->height; y += my) {		/* Vertical loop of MCUs */
-		for (x = 0; x < jd->width; x += mx) {	/* Horizontal loop of MCUs */
-			if (jd->nrst && rst++ == jd->nrst) {	/* Process restart interval if enabled */
-				rc = restart(jd, rsc++);
-				if (rc != JDR_OK) return rc;
-				rst = 1;
-			}
-			rc = mcu_load(jd);					/* Load an MCU (decompress huffman coded stream, dequantize and apply IDCT) */
-			if (rc != JDR_OK) return rc;
-			rc = mcu_output(jd, outfunc, x, y);	/* Output the MCU (YCbCr to RGB, scaling and output) */
-			if (rc != JDR_OK) return rc;
-		}
-	}
-
+	JRESULT rc = jd_decomp_begin(jd, outfunc, scale);
+	if (rc != JDR_OK) return rc;
+	do {
+		rc = jd_decomp_step(jd, outfunc, 0xFFFFFFFFu);
+	} while (rc == JDR_MORE);
 	return rc;
 }

@@ -37,7 +37,12 @@ enum { V_PORTRAIT, V_SPREAD_L, V_DUAL_L, V_SPREAD_R, V_DUAL_R, V_COUNT };   // _
 
 typedef struct { void *px; int w, h, gray; } Img;      // gray: 1 byte (0..63) per pixel, else RGB565
 typedef struct { FILE *f; uint32_t left; Img *img; int abortable; int tick; } Dec;
-typedef struct { int page, want; Img im; size_t bytes; } Slot;
+typedef struct { int page, want, scale, srcw, srch, hi; Img im; size_t bytes; } Slot;
+typedef struct {                       // one resumable background decode (current page only)
+    JDEC jd; Dec d; Img im;
+    int page, want, scale, srcw, srch, active, is_hi;
+    size_t bytes;
+} Up;
 typedef struct { char *name; long last; int page, npages, kind; u16 *thumb; } Book;   // kind 0 = PDF, 1 = text
 
 static struct { int quality, gap, view, rtl; } cfg = { 1, 40, 0, 1 };   // gap = pixels hidden by the hinge
@@ -46,24 +51,33 @@ static u16 *g_buf; static int g_bufw;   // draw into a memory buffer instead (th
 static int g_rot;           // 0 portrait, 1 book (top screen on left), 2 book (top screen on right)
 static u16 g_sink;          // pixels that fall under the hinge are written here
 static size_t g_slot;       // RAM budget per cached page
+static size_t g_hi;         // larger budget for the current page's zoom detail
 static size_t g_ram;        // biggest heap block we could get at startup
 static int g_nslot = 3;     // cache slots used by the current book (3 or 5)
 static int g_maxslot = 3;
 static int g_ramkb;
-static int g_want;          // decoded width we want for the current zoom
 static size_t g_cachebytes, g_cachepeak, g_lastpeak;
 static int g_lastpages;
 static u16 invtab[INVMAX + 1];   // 16.16 reciprocal for 1..INVMAX
 static u8 g_pool[8192];          // TJpgDec work pool (one decode runs at a time)
 static u32 g_pend;          // key presses seen while a background decode was running
 static Slot cache[NSLOT];
+static int g_curpage = -1;   // displayed page: never evicted by prefetch
+static int g_curpage2 = -1;  // second displayed page in DUAL view
+static Up g_up;             // current-page detail upgrade (chunked JPEG decode)
+#define UP_PIXELS (192u * 4u * 64u)   // ~192 4:2:0 MCUs per frame; keeps input responsive
+#define HI_CAP (4u << 20)   // cap for one zoomed page; grayscale full-res usually fits
 static Book bk[MAXBOOKS];   // the library
 static int nbook;
+
+static size_t ram_reserve(size_t ram) {
+    return ram < (6u << 20) ? (2u << 20) : (1536u << 10);
+}
 
 // Split the heap between page slots, keeping a reserve for the library, PDF tables,
 // audio and the stack. A single cached page never gets more than 1.5 MB.
 static size_t slot_budget(size_t ram, int nslot) {
-    size_t reserve = ram < (6u << 20) ? (2u << 20) : (1536u << 10);
+    size_t reserve = ram_reserve(ram);
     if (ram <= reserve + (128u << 10)) return 128u << 10;
     size_t b = (ram - reserve) / nslot;
     if (b > (1536u << 10)) b = 1536u << 10;
@@ -156,33 +170,48 @@ static int jout(JDEC *jd, void *bm, JRECT *r) {
     return 1;
 }
 
+// Pick the smallest JPEG descale factor whose output still meets target and
+// fits budget. Unlike the old code this accounts for the budget while choosing,
+// so a request that cannot be satisfied does not repeatedly re-decode the page.
+static int choose_scale(int sw, int sh, int bpp, int target, size_t budget) {
+    if (target < 1) target = 1;
+    int s = 0;
+    while (s < 3 && (sw >> (s + 1)) >= target) s++;
+    for (;; s++) {
+        int w = (sw + (1 << s) - 1) >> s;
+        int h = (sh + (1 << s) - 1) >> s;
+        if ((size_t)w * h * bpp <= budget || s >= 3) return s;
+    }
+}
+
 // 0 ok, -1 failed, -2 interrupted. Gray JPEGs use 1 byte/pixel, so they decode
 // at twice the resolution for the same RAM.
-static int decode(Pdf *pdf, int pg, Img *im, int abortable, int target) {
+static int decode_into(Pdf *pdf, int pg, Img *im, int abortable, int target,
+                       size_t budget, int *out_scale, int *out_srcw, int *out_srch) {
     memset(im, 0, sizeof *im);
     Dec d = { pdf->f, pdf->pages[pg].len, im, abortable, 0 };
     fseek(pdf->f, pdf->pages[pg].off, SEEK_SET);
     JDEC jd;
-    int rc = -1;
-    if (jd_prepare(&jd, jin, g_pool, sizeof g_pool, &d) == JDR_OK) {
-        im->gray = jd.ncomp == 1;
-        size_t bpp = im->gray ? 1 : 2;
-        int s = 0;
-        while (s < 3 && (jd.width >> (s + 1)) >= target) s++;
-        for (;; s++) {                       // shrink further until it fits the slot budget
-            im->w = (jd.width + (1 << s) - 1) >> s;
-            im->h = (jd.height + (1 << s) - 1) >> s;
-            size_t need = (size_t)im->w * im->h * bpp;
-            im->px = (need <= g_slot || s >= 3) ? malloc(need) : NULL;
-            if (im->px || s >= 3) break;
-        }
-        if (im->px) {
-            JRESULT r = jd_decomp(&jd, jout, s);
-            if (r == JDR_OK) rc = 0;
-            else { free(im->px); im->px = NULL; if (r == JDR_INTR) rc = -2; }
-        }
+    if (jd_prepare(&jd, jin, g_pool, sizeof g_pool, &d) != JDR_OK) return -1;
+    im->gray = jd.ncomp == 1;
+    int bpp = im->gray ? 1 : 2;
+    int s = choose_scale(jd.width, jd.height, bpp, target, budget);
+    for (;;) {
+        im->w = (jd.width + (1 << s) - 1) >> s;
+        im->h = (jd.height + (1 << s) - 1) >> s;
+        size_t need = (size_t)im->w * im->h * bpp;
+        im->px = malloc(need);
+        if (im->px || s >= 3) break;
+        s++;                                // fragmented heap: try the next 1/2 step
     }
-    return rc;
+    if (!im->px) return -1;
+    JRESULT r = jd_decomp(&jd, jout, s);
+    if (r != JDR_OK) {
+        free(im->px); memset(im, 0, sizeof *im);
+        return r == JDR_INTR ? -2 : -1;
+    }
+    *out_scale = s; *out_srcw = jd.width; *out_srch = jd.height;
+    return 0;
 }
 
 // ---- page cache ------------------------------------------------------------
@@ -201,7 +230,8 @@ static void slot_drop(Slot *s) {
         g_cachebytes -= s->bytes;
         memset(&s->im, 0, sizeof s->im);
     }
-    s->page = -1; s->want = 0; s->bytes = 0;
+    s->page = -1; s->want = 0; s->scale = 0; s->srcw = 0; s->srch = 0;
+    s->hi = 0; s->bytes = 0;
 }
 static void trim(int lo, int hi) {           // drop everything outside [lo,hi]
     for (int i = 0; i < g_nslot; i++)
@@ -215,6 +245,7 @@ static Slot *slot_for(int pg) {
         Slot *s = &cache[i];
         if (s->page == pg) return s;
         if (!s->im.px) { if (!freeS) freeS = s; continue; }
+        if (s->page == g_curpage || s->page == g_curpage2) continue;
         int d = s->page > pg ? s->page - pg : pg - s->page;
         if (d > fd) { fd = d; far = s; }
     }
@@ -222,21 +253,164 @@ static Slot *slot_for(int pg) {
     if (s) slot_drop(s);
     return s;
 }
-static Img *load(Pdf *pdf, int pg, u8 *bad, int abortable) {
-    int want = g_want / (cfg.quality ? 1 : 2);   // normal quality: one JPEG scale step down
+static void make_room(size_t need, int keep);
+
+static Img *load_detail(Pdf *pdf, int pg, u8 *bad, int want, size_t budget, int abortable) {
     Slot *s = find_slot(pg);
-    if (s && s->im.px && s->want >= want) return &s->im;
-    s = slot_for(pg);
-    if (!s) return NULL;
-    slot_drop(s);                                // same page at too low a detail level: replace it
-    int rc = decode(pdf, pg, &s->im, abortable, want);
-    if (rc) { slot_drop(s); if (rc == -1) bad[pg] = 1; return NULL; }
-    s->page = pg;
-    s->want = want;
-    s->bytes = (size_t)s->im.w * s->im.h * (s->im.gray ? 1 : 2);
-    g_cachebytes += s->bytes;
+    if (s && s->im.px) {
+        if (s->want >= want) return &s->im;
+        if (s->scale == 0) { s->want = want; return &s->im; }
+        if (s->srcw > 0) {
+            int ns = choose_scale(s->srcw, s->srch, s->im.gray ? 1 : 2, want, budget);
+            if (ns >= s->scale) { s->want = want; return &s->im; }
+        }
+    }
+    if (!s) { s = slot_for(pg); if (!s) return NULL; }
+    make_room(budget, pg);
+    int same = s->page == pg && s->im.px;
+    Img old = s->im;
+    size_t oldbytes = s->bytes;
+    Img tmp; int sc = 0, sw = 0, sh = 0;
+    int rc = decode_into(pdf, pg, &tmp, abortable, want, budget, &sc, &sw, &sh);
+    if (rc) { if (!same && rc == -1) bad[pg] = 1; return same ? &s->im : NULL; }
+    size_t tb = (size_t)tmp.w * tmp.h * (tmp.gray ? 1 : 2);
+    if (g_cachebytes + tb > g_cachepeak) g_cachepeak = g_cachebytes + tb;
+    if (same) {
+        if (tmp.w <= old.w) { free(tmp.px); s->want = want; return &s->im; }
+        free(old.px);
+        g_cachebytes -= oldbytes;
+    }
+    s->im = tmp; s->page = pg; s->want = want;
+    s->scale = sc; s->srcw = sw; s->srch = sh;
+    s->bytes = tb; s->hi = budget > g_slot;
+    g_cachebytes += tb;
     if (g_cachebytes > g_cachepeak) g_cachepeak = g_cachebytes;
     return &s->im;
+}
+
+// Background current-page upgrade -------------------------------------------------
+
+static void up_cancel(void) {
+    if (g_up.active && g_up.im.px) free(g_up.im.px);
+    memset(&g_up, 0, sizeof g_up);
+}
+
+static void drop_hi_except(int pg) {
+    for (int i = 0; i < g_nslot; i++)
+        if (cache[i].hi && cache[i].page != pg) slot_drop(&cache[i]);
+}
+
+// Keep the current page; evict the farthest neighbours if the temporary
+// high-detail image would otherwise push the cache past the safe heap budget.
+static void make_room(size_t need, int keep) {
+    size_t reserve = ram_reserve(g_ram);
+    size_t cap = g_ram > reserve ? g_ram - reserve : g_ram / 2;
+    while (g_cachebytes + need > cap) {
+        Slot *far = NULL; int fd = -1;
+        for (int i = 0; i < g_nslot; i++) {
+            Slot *s = &cache[i];
+            if (!s->im.px || s->page == keep || s->page == g_curpage || s->page == g_curpage2) continue;
+            int d = s->page > keep ? s->page - keep : keep - s->page;
+            if (d > fd) { fd = d; far = s; }
+        }
+        if (!far) break;
+        slot_drop(far);
+    }
+}
+
+// Start (or retarget) a chunked decode of the current page. The displayed
+// low-res image stays in its slot until the better image is complete.
+static int up_start(Pdf *pdf, int pg, int want, size_t budget) {
+    if (g_up.active) {
+        if (g_up.page == pg) {
+            int ns = choose_scale(g_up.srcw, g_up.srch, g_up.im.gray ? 1 : 2, want, budget);
+            if (ns >= g_up.scale) {
+                if (want > g_up.want) g_up.want = want;
+                return 0;
+            }
+        }
+        up_cancel();
+    }
+    Slot *s = find_slot(pg);
+    if (!s || !s->im.px) return -1;
+    if (budget <= g_slot && s->want >= want) return 0;
+    if (s->scale == 0) { if (want > s->want) s->want = want; return 0; }
+    if (s->srcw > 0) {
+        int ns = choose_scale(s->srcw, s->srch, s->im.gray ? 1 : 2, want, budget);
+        if (ns >= s->scale) { if (want > s->want) s->want = want; return 0; }
+    }
+
+    memset(&g_up, 0, sizeof g_up);
+    g_up.page = pg; g_up.want = want;
+    g_up.d.f = pdf->f; g_up.d.left = pdf->pages[pg].len;
+    g_up.d.img = &g_up.im; g_up.d.abortable = 0;
+    fseek(pdf->f, pdf->pages[pg].off, SEEK_SET);
+    if (jd_prepare(&g_up.jd, jin, g_pool, sizeof g_pool, &g_up.d) != JDR_OK) {
+        memset(&g_up, 0, sizeof g_up);
+        return -1;
+    }
+    g_up.srcw = g_up.jd.width; g_up.srch = g_up.jd.height;
+    g_up.im.gray = g_up.jd.ncomp == 1;
+    int bpp = g_up.im.gray ? 1 : 2;
+    int sc = choose_scale(g_up.srcw, g_up.srch, bpp, want, budget);
+    size_t need = 0;
+    for (;;) {
+        g_up.im.w = (g_up.srcw + (1 << sc) - 1) >> sc;
+        g_up.im.h = (g_up.srch + (1 << sc) - 1) >> sc;
+        need = (size_t)g_up.im.w * g_up.im.h * bpp;
+        make_room(need, pg);
+        g_up.im.px = malloc(need);
+        if (g_up.im.px || sc >= 3) break;
+        sc++;
+    }
+    if (!g_up.im.px) { memset(&g_up, 0, sizeof g_up); return -1; }
+    if (jd_decomp_begin(&g_up.jd, jout, sc) != JDR_OK) {
+        free(g_up.im.px); memset(&g_up, 0, sizeof g_up);
+        return -1;
+    }
+    g_up.scale = sc; g_up.bytes = need; g_up.is_hi = budget > g_slot;
+    g_up.active = 1;
+    if (g_cachebytes + need > g_cachepeak) g_cachepeak = g_cachebytes + need;
+    return 0;
+}
+
+// Returns 1 when the slot image was replaced (redraw), 0 otherwise.
+static int up_step(void) {
+    if (!g_up.active) return 0;
+    // Grayscale JPEGs use 8x8 MCUs; scale the budget by MCU area so a chunk
+    // costs about the same on grayscale and colour pages.
+    unsigned int blocks = (unsigned int)g_up.jd.msx * g_up.jd.msy;
+    unsigned int mc = blocks ? UP_PIXELS / (blocks * 64u) : 192u;
+    if (mc < 32) mc = 32;
+    JRESULT r = jd_decomp_step(&g_up.jd, jout, mc);
+    if (r == JDR_MORE) return 0;
+    if (r != JDR_OK) { up_cancel(); return 0; }
+
+    Slot *s = find_slot(g_up.page);
+    Img tmp = g_up.im;
+    int pg = g_up.page, want = g_up.want, sc = g_up.scale, sw = g_up.srcw, sh = g_up.srch;
+    int is_hi = g_up.is_hi;
+    size_t tb = g_up.bytes;
+    g_up.im.px = NULL;
+    memset(&g_up, 0, sizeof g_up);
+    int changed = 0;
+    if (s && s->im.px) {
+        if (tmp.w > s->im.w) {
+            if (is_hi) drop_hi_except(pg);
+            free(s->im.px);
+            g_cachebytes -= s->bytes;
+            s->im = tmp; s->page = pg; s->want = want;
+            s->scale = sc; s->srcw = sw; s->srch = sh;
+            s->bytes = tb; s->hi = is_hi;
+            g_cachebytes += tb;
+            if (g_cachebytes > g_cachepeak) g_cachepeak = g_cachebytes;
+            changed = 1;
+        } else {
+            free(tmp.px);
+            if (want > s->want) s->want = want;
+        }
+    } else free(tmp.px);
+    return changed;
 }
 
 // ---- drawing ---------------------------------------------------------------
@@ -380,6 +554,20 @@ static void vkeys(u32 *l, u32 *r, u32 *u, u32 *d) {
 static int rot_of(int view) { return view == V_PORTRAIT ? 0 : view <= V_DUAL_L ? 1 : 2; }
 static int is_dual(int view) { return view == V_DUAL_L || view == V_DUAL_R; }
 
+// Width of the image window actually shown by this view. Decode targets come
+// from this, not from a fixed 384*f: portrait was decoding 1.5x too wide.
+static int view_px(int view) {
+    return view == V_PORTRAIT ? 256 : view <= V_DUAL_L ? 192 : 384 + cfg.gap;
+}
+static int base_px(int view) {          // normal quality: one JPEG step lower
+    int w = view_px(view);
+    return cfg.quality ? w : (w + 1) / 2;
+}
+static int preview_px(int view) {       // fast first image for page turns
+    int w = base_px(view);
+    return w > 128 ? w / 2 : 64;
+}
+
 // Draw whatever the current view needs. Sets the rotation itself, so it can never be stale.
 static void draw_view(int view, int page, int n, int rtl, int f, int *ox, int *oy, const u8 *bad) {
     g_rot = rot_of(view);
@@ -450,7 +638,8 @@ static void thumb_make(Book *b, const char *path) {
     if (pdf_open(&pdf, path) || !pdf.npages) { pdf_close(&pdf); return; }
     b->npages = pdf.npages;
     Img im;
-    if (decode(&pdf, 0, &im, 0, 100) == 0) {
+    int sc = 0, sw = 0, sh = 0;
+    if (decode_into(&pdf, 0, &im, 0, 100, g_slot, &sc, &sw, &sh) == 0) {
         int ox = 0, oy = 0;
         clamp_pan(&im, TW, TH, 1, &ox, &oy);
         g_buf = t; g_bufw = TW;
@@ -518,14 +707,25 @@ static void reader(Book *b, const char *path, int start) {
     int n = pdf.npages;
     u8 *bad = calloc(n, 1);
     int page = start < 0 ? 0 : start >= n ? n - 1 : start;
+    g_curpage = page;
     int view = cfg.view, rtl = cfg.rtl, f = 1, ox = 0, oy = 0, dirty = 1, turns = 0, tx = -1, ty = -1;
+    int page_changed = 0;
     b->npages = n;
     // Small books: current + 2 back + 2 ahead in RAM. Large books: current + 1 each way.
     g_nslot = pdf.size < (5u << 20) ? g_maxslot : (g_maxslot >= 5 ? 3 : g_maxslot);
     g_slot = slot_budget(g_ram, g_nslot);
+    size_t reserve = ram_reserve(g_ram);
+    size_t free_ram = g_ram > reserve ? g_ram - reserve : g_ram / 2;
+    g_hi = free_ram > g_slot ? free_ram - g_slot : g_slot;
+    if (g_hi > HI_CAP) g_hi = HI_CAP;
     g_cachebytes = g_cachepeak = 0;
     g_lastpeak = 0;
-    for (int i = 0; i < NSLOT; i++) { cache[i].page = -1; cache[i].im.px = NULL; cache[i].want = 0; cache[i].bytes = 0; }
+    up_cancel();
+    for (int i = 0; i < NSLOT; i++) {
+        cache[i].page = -1; cache[i].im.px = NULL; cache[i].want = 0;
+        cache[i].scale = 0; cache[i].srcw = 0; cache[i].srch = 0;
+        cache[i].hi = 0; cache[i].bytes = 0;
+    }
     gfx_reader();
     touchPosition tp;
 
@@ -557,13 +757,12 @@ static void reader(Book *b, const char *path, int start) {
         }
         if (dn & KEY_Y) { rtl ^= 1; ox = rtl ? 1 << 20 : 0; dirty = 1; }
         if ((dn & KEY_X) && !dual) { f = f % 4 + 1; ox = pan0; oy = 0; dirty = 1; }
-        g_want = 384 * f;                    // widest view; zoom adds detail on demand
         if (step) {
             int np = page + step;
             if (np < 0) np = 0;
             if (np > n - 1) np = n - 1;
             if (np != page) {
-                page = np; ox = pan0; oy = 0; dirty = 1;
+                page = np; g_curpage = page; ox = pan0; oy = 0; dirty = 1; page_changed = 1;
                 b->page = page;
                 if (++turns % 10 == 0) { b->last = time(NULL); lib_save(); }   // survive a dead battery
             }
@@ -589,17 +788,43 @@ static void reader(Book *b, const char *path, int start) {
         } else tx = -1;
 
         int span = g_nslot >= 5 ? 2 : 1;
+        g_curpage = page;
+        g_curpage2 = (dual && page + 1 < n) ? page + 1 : -1;
+        int base = base_px(view), preview = preview_px(view);
+        int was_turn = page_changed;
+        if (page_changed) {                                    // old high-detail image is for another page
+            page_changed = 0;
+            up_cancel();
+            drop_hi_except(page);
+        }
         if (dirty) {
             dirty = 0;
             trim(page - span, page + span);
-            if (!cached(page)) busy();
-            load(&pdf, page, bad, 0);
-            if (dual && page + 1 < n) load(&pdf, page + 1, bad, 0);
+            if (!cached(page)) {                               // first view of this page
+                busy();
+                load_detail(&pdf, page, bad, (!dual && was_turn) ? preview : base, g_slot, 0);
+            }
+            if (dual && page + 1 < n && !cached(page + 1)) {
+                busy();
+                load_detail(&pdf, page + 1, bad, base, g_slot, 0);
+            }
             draw_view(view, page, n, rtl, f, &ox, &oy, bad);
             progress_line(page, n);
-        } else if (!hd && !dn) {                               // idle: fill the cache
+        }
+
+        // Current page first: sharpen it in the background, one small chunk per
+        // frame. Zoom detail is decoded once at the widest useful target, so
+        // 2x/3x/4x reuse it instead of re-decoding the same resolution.
+        if (!dual) {
+            int target = f > 1 ? view_px(view) * 4 : base;
+            up_start(&pdf, page, target, f > 1 ? g_hi : g_slot);
+        }
+        if (g_up.active) {
+            if (up_step()) dirty = 1;                          // better image is ready
+        } else if (!hd && !dn) {                               // idle: fast previews only
             int cand[4];
             int nc = 0, hi = page + span + (dual ? 1 : 0);
+            int pv = dual ? base : preview;
             cand[nc++] = page + (dual ? 2 : 1);
             cand[nc++] = page + (dual ? 3 : 2);
             cand[nc++] = page - 1;
@@ -607,12 +832,14 @@ static void reader(Book *b, const char *path, int start) {
             for (int i = 0; i < nc; i++) {
                 int c = cand[i];
                 if (c >= page - span && c <= hi && c >= 0 && c < n &&
-                    !bad[c] && !cached(c)) { load(&pdf, c, bad, 1); break; }
+                    !bad[c] && !cached(c)) { load_detail(&pdf, c, bad, pv, g_slot, 1); break; }
             }
         }
     }
     cfg.view = view; cfg.rtl = rtl;
     b->page = page;
+    up_cancel();
+    g_curpage = g_curpage2 = -1;
     g_lastpeak = g_cachepeak;
     g_lastpages = 0;
     for (int i = 0; i < g_nslot; i++) if (cache[i].im.px) g_lastpages++;

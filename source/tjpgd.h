@@ -38,7 +38,8 @@ typedef enum {
 	JDR_PAR,	/* 5: Parameter error */
 	JDR_FMT1,	/* 6: Data format error (may be broken data) */
 	JDR_FMT2,	/* 7: Right format but not supported */
-	JDR_FMT3	/* 8: Not supported JPEG standard */
+	JDR_FMT3,	/* 8: Not supported JPEG standard */
+	JDR_MORE	/* 9: Step limit reached; call jd_decomp_step again */
 } JRESULT;
 
 
@@ -67,6 +68,9 @@ struct JDEC {
 	int16_t dcv[3];				/* Previous DC element of each component */
 	uint16_t nrst;				/* Restart inverval */
 	uint16_t width, height;		/* Size of the input image (pixel) */
+	uint16_t x, y;				/* Current MCU position (resumable decode) */
+	uint16_t rst, rsc;			/* Restart interval state (resumable decode) */
+	uint8_t started;			/* Nonzero while a resumable decode is active */
 	uint8_t* huffbits[2][2];	/* Huffman bit distribution tables [id][dcac] */
 	uint16_t* huffcode[2][2];	/* Huffman code word tables [id][dcac] */
 	uint8_t* huffdata[2][2];	/* Huffman decoded data tables [id][dcac] */
@@ -93,6 +97,11 @@ struct JDEC {
 /* TJpgDec API functions */
 JRESULT jd_prepare (JDEC* jd, size_t (*infunc)(JDEC*,uint8_t*,size_t), void* pool, size_t sz_pool, void* dev);
 JRESULT jd_decomp (JDEC* jd, int (*outfunc)(JDEC*,void*,JRECT*), uint8_t scale);
+
+/* Resumable variant: begin a decode, then call step until it no longer returns
+/ JDR_MORE. The caller may do other work between steps. */
+JRESULT jd_decomp_begin (JDEC* jd, int (*outfunc)(JDEC*,void*,JRECT*), uint8_t scale);
+JRESULT jd_decomp_step (JDEC* jd, int (*outfunc)(JDEC*,void*,JRECT*), unsigned int max_mcus);
 
 
 #ifdef __cplusplus
