@@ -28,6 +28,17 @@ ENHANCED  (source/enhanced.c)  for DSi mode / 16 MB RAM:
   * library: cover grid (first page), green progress bar per book, sorted by last opened,
     A resumes at the saved page, B starts at page 1. Saved in <folder>/dsimanga.lib,
     covers cached next to each PDF as <name>.pdf.thm
+  * EPUB (DSi edition only): .epub files join the library next to PDFs and TXTs.
+    Own ZIP/OPF/XHTML module (source/epub.c); the PDF, TXT and music paths are
+    untouched. Supports EPUB 2 and basic EPUB 3, spine order, EPUB 3 nav or
+    EPUB 2 NCX contents (SELECT), wrapped text pages, full-screen embedded
+    JPEG/PNG illustrations (plus SVG <image> wrappers used by fixed-layout
+    comics), chapter progress and cached covers. Text is ASCII: common Latin-1
+    accents and smart punctuation are mapped, CJK glyphs are not available.
+    CSS layout (floats/tables/columns), embedded fonts and DRM are not rendered.
+    Baseline JPEG and 8-bit non-interlaced PNG work; progressive JPEG is not
+    supported by TJpgDec. Opening or switching chapters costs a ZIP decompress,
+    then page turns are immediate; the next illustration is prefetched.
 
 BUILD
   1. Install devkitPro (devkitARM, libnds, libfat), plus maxmod and libmad for DSi
@@ -40,7 +51,7 @@ BUILD
      JD_FASTDECODE 1  (the 32-bit ARM9 path; JD_FORMAT 0 or 1 both work).
      (enhanced.c reads jd.ncomp from the JDEC struct to detect grayscale JPEGs.)
   3. make        -> dsimanga.nds        make dsi  -> dsimanga_dsi.nds
-  Put the .nds on the SD card, PDFs in /manga and MP3s in /mp3.
+  Put the .nds on the SD card, PDFs/EPUBs in /manga and MP3s in /mp3.
   DSi music is enabled by default (`-lmm9 -lmad`, `-DUSE_AUDIO`). Use
   `make dsi AUDIO=0` for a build without music. AUDIO must be 0 or 1.
   The DSi build uses high title ID 00030000 (DSi-enhanced gamecard). Do not
@@ -91,6 +102,9 @@ CONTROLS
            Y reading direction (starts right-to-left), X zoom 1x-4x, SELECT view,
            L+A+DOWN music menu, L+UP show/hide music overlay,
            zoomed: D-pad / touch-drag pan, START back to library
+  EPUB (DSi edition only):
+           A/R/L/B/D-pad turn pages, UP/DOWN previous/next chapter,
+           SELECT table of contents, START back to library
            Green line along the bottom of the lower screen = reading progress
   Red square top-right = decoding. Blue strip at the top = current-page detail
   progress. Red screen = page can't be decoded (progressive JPEG etc).
@@ -100,5 +114,7 @@ CONTROLS
 HOST TESTS (no DSi needed)
   gcc -O1 -o test_pdf tools/test_pdf.c source/pdf.c && python3 tools/gen_test_pdfs.py ./test_pdf
   gcc -O1 -Isource -o id3art_test tools/id3art_test.c source/id3art.c && ./id3art_test
-  gcc -O1 -Itools/stubs -Isource -o dir_test tools/dir_test.c source/pdf.c source/id3art.c tools/stubs/stubs.c && ./dir_test
-  gcc -O1 -Itools/stubs -Isource -o render_test tools/render_test.c source/pdf.c source/id3art.c tools/stubs/stubs.c && ./render_test
+  gcc -O1 -Itools/stubs -Isource -o dir_test tools/dir_test.c source/pdf.c source/id3art.c source/epub.c tools/stubs/stubs.c && ./dir_test
+  gcc -O1 -Itools/stubs -Isource -o render_test tools/render_test.c source/pdf.c source/id3art.c source/epub.c tools/stubs/stubs.c && ./render_test
+  gcc -O1 -Itools/stubs -Isource -o text_test tools/text_test.c source/pdf.c source/id3art.c source/epub.c tools/stubs/stubs.c && ./text_test
+  gcc -O1 -Isource -o epub_test tools/epub_test.c source/epub.c && python3 tools/gen_test_epubs.py /tmp/epub_fixtures && ./epub_test /tmp/epub_fixtures

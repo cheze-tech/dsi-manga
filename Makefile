@@ -40,10 +40,10 @@ endif
 LDFLAGS   := -specs=$(DEVKITPRO)/calico/share/ds9.specs -g $(ARCH) -Wl,--gc-sections -L$(LIBNDS)/lib -L$(DEVKITPRO)/calico/lib $(PORTLIB)
 COMMON    := source/pdf.c source/tjpgd.c
 SRC_DS    := $(COMMON) source/main.c
-SRC_DSI   := $(COMMON) source/enhanced.c source/audio.c source/id3art.c
+SRC_DSI   := $(COMMON) source/enhanced.c source/audio.c source/id3art.c source/epub.c
 # Header changes must relink too; otherwise `make` silently keeps an old ROM
 # (the whole program is compiled in one command, so there are no .o files).
-HDRS      := source/tjpgd.h source/tjpgdcnf.h
+HDRS      := source/tjpgd.h source/tjpgdcnf.h source/epub.h
 
 all: dsimanga.nds
 dsi: dsimanga_dsi.nds

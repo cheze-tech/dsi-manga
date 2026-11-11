@@ -1,6 +1,6 @@
 // Host test: checks d-pad orientation, reading direction, dual-page steps and
 // that rapid/held/overlapping input can never turn a page backwards.
-//   gcc -O1 -Itools/stubs -Isource -o dir_test tools/dir_test.c source/pdf.c source/id3art.c tools/stubs/stubs.c
+//   gcc -O1 -Itools/stubs -Isource -o dir_test tools/dir_test.c source/pdf.c source/id3art.c source/epub.c tools/stubs/stubs.c
 #define main enhanced_main
 #include "enhanced.c"
 #undef main

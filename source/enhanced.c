@@ -8,6 +8,9 @@
 //   SELECT = next song   L+A+DOWN = music menu   L+UP = toggle overlay
 //   START library
 //   (.txt files: A/R/L/B/D-pad turn pages)
+//   (.epub files: A/R/L/B/D-pad turn pages, UP/DOWN change chapter,
+//    SELECT opens the table of contents.  EPUB has its own module and only
+//    appears in the DSi build; PDF/TXT/music code is untouched.)
 //   Views: PORTRAIT (one page over both screens) -> SPREAD (one wide page over both
 //   screens, console held sideways) -> DUAL (two pages, one per screen, held sideways)
 //   Zoomed: D-pad or touch-drag pans.  The green line at the bottom is progress.
@@ -22,6 +25,7 @@
 #include <strings.h>
 #include <time.h>
 #include "pdf.h"
+#include "epub.h"
 #include "audio.h"
 #include "id3art.h"
 #include "tjpgd.h"          // TJpgDec R0.03: JD_USE_SCALE 1, JD_FORMAT 0 or 1
@@ -47,7 +51,7 @@ typedef struct {                       // one resumable background decode (curre
     int page, want, scale, srcw, srch, active, is_hi;
     size_t bytes;
 } Up;
-typedef struct { char *name; long last; int page, npages, kind; u16 *thumb; } Book;   // kind 0 = PDF, 1 = text
+typedef struct { char *name; long last; int page, npages, kind; u16 *thumb; } Book;   // kind 0 = PDF, 1 = text, 2 = EPUB
 
 static struct { int quality, gap, view, rtl; } cfg = { 1, 40, 0, 1 };   // gap = pixels hidden by the hinge
 static u16 *scr[2];         // top, bottom framebuffers (256 px stride)
@@ -1237,20 +1241,22 @@ static void draw_library(int sel, const char *dir) {
     }
     consoleClear();
     iprintf("DSi manga reader  %s %dMB\n", isDSiMode() ? "DSi" : "DS", g_ramkb / 1024);
-    if (!n) { iprintf("\nNo PDFs in %s\n", dir); return; }
+    if (!n) { iprintf("\nNo books in %s\n", dir); return; }
     Book *b = &bk[sel];
     iprintf("\n%.31s\n", b->name);
     if (b->last > 0 && b->npages > 0) {
         long days = (long)(time(NULL) - b->last) / 86400;
-        iprintf("Page %d/%d  (%d%%)\n", b->page + 1, b->npages, 100 * (b->page + 1) / b->npages);
+        if (b->kind == 2) iprintf("Chapter %d/%d  (%d%%)\n", b->page + 1, b->npages, 100 * (b->page + 1) / b->npages);
+        else iprintf("Page %d/%d  (%d%%)\n", b->page + 1, b->npages, 100 * (b->page + 1) / b->npages);
         iprintf("Last read: %s\n", days <= 0 ? "today" : days == 1 ? "yesterday" : "a while ago");
         if (days > 1) iprintf("           %ld days ago\n", days);
-    } else iprintf(b->kind ? "text file - not opened yet\n" : "%d pages - not opened yet\n", b->npages);
+    } else if (b->kind == 2) iprintf("epub - not opened yet\n");
+    else iprintf(b->kind ? "text file - not opened yet\n" : "%d pages - not opened yet\n", b->npages);
     iprintf("\nRAM: %dMB heap, %dKB/page\n", g_ramkb / 1024, (int)(g_slot >> 10));
     if (g_maxslot > 4) iprintf("Cache: %d slots (5 if <5MB)\n", g_nslot);
     else iprintf("Cache: %d slots\n", g_nslot);
     if (g_lastpeak) iprintf("Last read: %d pages, %dKB peak\n", g_lastpages, (int)(g_lastpeak >> 10));
-    iprintf("\nA resume   B from page 1\nX quality: %s\nHinge gap: %d px (change it in\nthe reader: D-pad up/down)\nSTART quit\n",
+    iprintf("\nA resume   B from the start\nX quality: %s\nHinge gap: %d px (change it in\nthe reader: D-pad up/down)\nSTART quit\n",
             cfg.quality ? "high" : "normal", cfg.gap);
     const char *song = audio_title();
     if (song) iprintf("\nMusic%s: %.21s\nSELECT next song   Y pause\n", audio_paused() ? " (paused)" : "", song);
@@ -1655,6 +1661,312 @@ static void thumb_txt(Book *b) {
     b->thumb = t;
 }
 
+// ---- EPUB ------------------------------------------------------------------
+// All container/OPF/XHTML/image work lives in epub.c.  This section only turns
+// its pages into pixels and maps keys; it never touches the PDF reader state.
+
+typedef struct { Dec d; const uint8_t *p; size_t n, pos; } MemDec;
+
+static size_t jin_mem(JDEC *jd, uint8_t *buf, size_t n) {
+    MemDec *m = jd->device;
+    if (m->pos >= m->n) return 0;
+    if (n > m->n - m->pos) n = m->n - m->pos;
+    if (buf) memcpy(buf, m->p + m->pos, n);
+    m->pos += n;
+    return n;
+}
+
+// A JPEG in RAM, decoded with the same TJpgDec/scale rules as PDF pages.  MemDec
+// starts with Dec so the existing jout() sees its Img pointer.
+static int decode_jpeg_mem(const uint8_t *p, size_t n, int target, size_t budget, Img *im) {
+    memset(im, 0, sizeof *im);
+    MemDec m;
+    memset(&m, 0, sizeof m);
+    m.p = p; m.n = n; m.d.img = im;
+    JDEC jd;
+    if (jd_prepare(&jd, jin_mem, g_pool, sizeof g_pool, &m) != JDR_OK) return -1;
+    im->gray = jd.ncomp == 1;
+    int bpp = im->gray ? 1 : 2;
+    int s = choose_scale(jd.width, jd.height, bpp, target, budget);
+    for (;;) {
+        im->w = (jd.width + (1 << s) - 1) >> s;
+        im->h = (jd.height + (1 << s) - 1) >> s;
+        im->px = malloc((size_t)im->w * im->h * bpp);
+        if (im->px || s >= 3) break;
+        s++;
+    }
+    if (!im->px) return -1;
+    if (jd_decomp(&jd, jout, s) != JDR_OK) {
+        free(im->px);
+        memset(im, 0, sizeof *im);
+        return -1;
+    }
+    return 0;
+}
+
+static int decode_epub_image(Epub *e, int id, int target, size_t budget, Img *im) {
+    memset(im, 0, sizeof *im);
+    uint8_t *d = NULL;
+    size_t n = 0;
+    if (epub_image_data(e, id, &d, &n)) return -1;
+    int w = 0, h = 0, gray = 0, type = 0;
+    int rc = -1;
+    if (!epub_image_probe(d, n, &w, &h, &gray, &type)) {
+        if (type == 1) rc = decode_jpeg_mem(d, n, target, budget, im);
+        else if (type == 2) {
+            uint16_t *px = NULL;
+            int ow = 0, oh = 0;
+            if (!epub_png_decode(d, n, target, &px, &ow, &oh)) {
+                im->px = px; im->w = ow; im->h = oh; im->gray = 0; rc = 0;
+            }
+        }
+    }
+    free(d);
+    return rc;
+}
+
+#define ECACHE 2
+static struct { int ch, pg, id; Img im; } ecache[ECACHE];
+static int ec_next;
+
+static void ec_clear(void) {
+    for (int i = 0; i < ECACHE; i++) {
+        if (ecache[i].im.px) free(ecache[i].im.px);
+        memset(&ecache[i], 0, sizeof ecache[i]);
+    }
+    ec_next = 0;
+}
+static Img *ec_get(int ch, int pg) {
+    for (int i = 0; i < ECACHE; i++)
+        if (ecache[i].im.px && ecache[i].ch == ch && ecache[i].pg == pg) return &ecache[i].im;
+    return NULL;
+}
+static void ec_put(int ch, int pg, int id, Img *im) {
+    int i = ec_next++ % ECACHE;
+    if (ecache[i].im.px) free(ecache[i].im.px);
+    ecache[i].ch = ch; ecache[i].pg = pg; ecache[i].id = id; ecache[i].im = *im;
+    memset(im, 0, sizeof *im);
+}
+
+static void epub_draw_text(Epub *e, const EpubPage *pg, int ch, int nch, int p, int pages) {
+    u16 bg = RGB15(1, 1, 3) | BIT(15);
+    u16 fg = RGB15(27, 28, 30) | BIT(15);
+    u16 dim = RGB15(10, 11, 14) | BIT(15);
+    ui_rect(scr[0], 0, 0, 256, 192, bg);
+    ui_rect(scr[1], 0, 0, 256, 192, bg);
+    const char *txt = epub_text(e);
+    char line[EPUB_COLS + 1];
+    for (int i = 0; i < pg->n && i < EPUB_ROWS; i++) {
+        const EpubLine *l = epub_line(e, pg->first + i);
+        if (!l || l->kind != EPUB_LINE_TEXT) continue;
+        int n = l->len > EPUB_COLS ? EPUB_COLS : l->len;
+        memcpy(line, txt + l->off, n);
+        line[n] = 0;
+        if (i < 24) ui_text(scr[0], 8, i * 8, line, fg, EPUB_COLS);
+        else ui_text(scr[1], 8, (i - 24) * 8, line, fg, EPUB_COLS);
+    }
+    char foot[48];
+    snprintf(foot, sizeof foot, "%d/%d  %d/%d  %s", ch + 1, nch, p + 1, pages, epub_chapter_title(e, ch));
+    ui_text(scr[1], 8, 184, foot, dim, EPUB_COLS);
+}
+
+static void epub_draw_image(Epub *e, int ch, int pg, int id) {
+    Img *hit = ec_get(ch, pg);
+    Img im;
+    if (hit) im = *hit;
+    else if (decode_epub_image(e, id, 256, g_slot, &im)) {
+        ui_rect(scr[0], 0, 0, 256, 192, RGB15(1, 1, 3) | BIT(15));
+        ui_rect(scr[1], 0, 0, 256, 192, RGB15(1, 1, 3) | BIT(15));
+        ui_text(scr[0], 8, 80, "Unsupported image", RGB15(31, 20, 0) | BIT(15), EPUB_COLS);
+        ui_text(scr[0], 8, 96, "JPEG baseline or PNG 8-bit", RGB15(20, 20, 24) | BIT(15), EPUB_COLS);
+        return;
+    }
+    g_rot = 0;
+    blit(&im, 0, 0, 256, 384 + cfg.gap, 1, 0, 0);
+    if (!hit) ec_put(ch, pg, id, &im);
+}
+
+static int epub_toc_menu(Epub *e, int cur) {
+    int n = epub_toc_count(e);
+    if (n <= 0) return -1;
+    int sel = 0, top = 0, redraw = 1;
+    for (int i = 0; i < n; i++) if (epub_toc_chapter(e, i) <= cur) sel = i;
+    if (sel - top >= 22) top = sel - 21;
+    for (;;) {
+        if (!pm_ok()) return -1;
+        if (redraw) {
+            ui_rect(scr[0], 0, 0, 256, 192, RGB15(1, 1, 3) | BIT(15));
+            for (int r = 0; r < 22 && top + r < n; r++) {
+                int i = top + r;
+                if (i == sel) ui_rect(scr[0], 0, r * 8, 256, 8, RGB15(8, 10, 20) | BIT(15));
+                char line[36];
+                snprintf(line, sizeof line, "%c%.30s", i == sel ? '>' : ' ', epub_toc_title(e, i));
+                ui_text(scr[0], 4, r * 8, line, i == sel ? (RGB15(31, 31, 31) | BIT(15))
+                                                          : (RGB15(22, 23, 26) | BIT(15)), 32);
+            }
+            ui_rect(scr[1], 0, 0, 256, 192, RGB15(1, 1, 3) | BIT(15));
+            ui_text(scr[1], 8, 8, "CONTENTS", RGB15(18, 28, 31) | BIT(15), -1);
+            ui_text(scr[1], 8, 28, "A  open chapter", RGB15(24, 24, 28) | BIT(15), -1);
+            ui_text(scr[1], 8, 40, "B  close", RGB15(24, 24, 28) | BIT(15), -1);
+            ui_text(scr[1], 8, 52, "D-pad  move", RGB15(24, 24, 28) | BIT(15), -1);
+            redraw = 0;
+        }
+        swiWaitForVBlank();
+        scanKeys();
+        audio_pump(4);
+        u32 dn = keysDown();
+        if (dn & (KEY_B | KEY_START)) return -1;
+        if (dn & KEY_A) return epub_toc_chapter(e, sel);
+        if (dn & KEY_DOWN) { if (sel + 1 < n) sel++; if (sel - top >= 22) top = sel - 21; redraw = 1; }
+        if (dn & KEY_UP) { if (sel > 0) sel--; if (sel < top) top = sel; redraw = 1; }
+        if (dn & KEY_RIGHT) { sel += 10; if (sel >= n) sel = n - 1; if (sel - top >= 22) top = sel - 21; redraw = 1; }
+        if (dn & KEY_LEFT) { sel -= 10; if (sel < 0) sel = 0; if (sel < top) top = sel; redraw = 1; }
+    }
+}
+
+static void epub_reader(Book *b, const char *path, int start) {
+    Epub *e = epub_open(path);
+    if (!e) {
+        iprintf("\nCan't open the EPUB.\nPress any key.\n");
+        wait_key();
+        return;
+    }
+    int nch = epub_chapters(e);
+    if (nch <= 0) {
+        iprintf("\nThis EPUB has no readable chapters.\nPress any key.\n");
+        wait_key();
+        epub_close(e);
+        return;
+    }
+    b->npages = nch;
+    int ch = start < 0 ? 0 : start >= nch ? nch - 1 : start;
+    int pg = 0, pages = epub_load_chapter(e, ch), dirty = 1, turns = 0;
+    if (pages < 1) pages = 0;
+    gfx_reader();
+    music_dirty = 1;
+    ec_clear();
+
+    for (;;) {
+        if (!pm_ok()) break;
+        swiWaitForVBlank();
+        scanKeys();
+        audio_pump(4);
+        u32 dn = keysDown();
+        if (dn & KEY_START) break;
+
+        if (dn & KEY_SELECT) {
+            int pick = epub_toc_menu(e, ch);
+            if (pick >= 0) {
+                ch = pick;
+                pg = 0;
+                pages = epub_load_chapter(e, ch);
+                ec_clear();
+                b->page = ch;
+            }
+            dirty = 1;
+        }
+        if (dn & KEY_DOWN) {
+            if (ch + 1 < nch) {
+                ch++; pg = 0;
+                pages = epub_load_chapter(e, ch);
+                ec_clear();
+                b->page = ch;
+                dirty = 1;
+            }
+        }
+        if (dn & KEY_UP) {
+            if (ch > 0) {
+                ch--; pg = 0;
+                pages = epub_load_chapter(e, ch);
+                ec_clear();
+                b->page = ch;
+                dirty = 1;
+            }
+        }
+
+        int step = 0;
+        if (dn & (KEY_A | KEY_R | KEY_RIGHT)) step = 1;
+        if (dn & (KEY_B | KEY_L | KEY_LEFT)) step = -1;
+        if (step) {
+            int np = pg + step;
+            if (np >= 0 && np < pages) {
+                pg = np; dirty = 1;
+                if (++turns % 10 == 0) { b->last = time(NULL); lib_save(); }
+            } else if (step > 0 && ch + 1 < nch) {
+                ch++; pg = 0;
+                pages = epub_load_chapter(e, ch);
+                ec_clear();
+                b->page = ch;
+                dirty = 1;
+            } else if (step < 0 && ch > 0) {
+                ch--;
+                pages = epub_load_chapter(e, ch);
+                pg = pages > 0 ? pages - 1 : 0;
+                ec_clear();
+                b->page = ch;
+                dirty = 1;
+            }
+        }
+
+        if (dirty) {
+            dirty = 0;
+            const EpubPage *p = epub_page(e, pg);
+            if (!p) {
+                ui_rect(scr[0], 0, 0, 256, 192, RGB15(1, 1, 3) | BIT(15));
+                ui_text(scr[0], 8, 80, "Empty chapter", RGB15(24, 24, 28) | BIT(15), EPUB_COLS);
+            } else if (p->img >= 0) {
+                epub_draw_image(e, ch, pg, p->img);
+            } else {
+                epub_draw_text(e, p, ch, nch, pg, pages);
+            }
+            // One page of slack: the next illustration is ready before its turn.
+            if (!keysHeld()) {
+                for (int k = pg + 1; k < pages && k < pg + 4; k++) {
+                    const EpubPage *q = epub_page(e, k);
+                    if (q && q->img >= 0 && !ec_get(ch, k)) {
+                        Img im;
+                        if (!decode_epub_image(e, q->img, 256, g_slot, &im)) ec_put(ch, k, q->img, &im);
+                        break;
+                    }
+                }
+            }
+        }
+        music_status_check();
+        if (music_dirty) { music_status_draw(); music_notice_draw(); music_dirty = 0; }
+    }
+    b->page = ch;
+    ec_clear();
+    epub_close(e);
+}
+
+static void thumb_epub(Book *b, const char *path) {
+    u16 *t = malloc(TW * TH * 2);
+    if (!t) return;
+    for (int i = 0; i < TW * TH; i++) t[i] = BIT(15);
+    b->thumb = t;
+    Epub *e = epub_open(path);
+    if (!e) return;
+    b->npages = epub_chapters(e);
+    int id = epub_cover(e);
+    if (id < 0) id = epub_first_image(e, 0);
+    if (id >= 0) {
+        Img im;
+        if (!decode_epub_image(e, id, 100, g_slot, &im)) {
+            int ox = 0, oy = 0;
+            clamp_pan(&im, TW, TH, 1, &ox, &oy);
+            g_buf = t; g_bufw = TW;
+            blit(&im, 0, 0, TW, TH, 1, ox, oy);
+            g_buf = NULL;
+            free(im.px);
+        }
+    }
+    char p[340];
+    snprintf(p, sizeof p, "%s.thm", path);
+    FILE *f = fopen(p, "wb");
+    if (f) { fwrite(&b->npages, 4, 1, f); fwrite(t, 2, TW * TH, f); fclose(f); }
+    epub_close(e);
+}
+
 // ---- main / library ----------------------------------------------------------
 
 static int book_cmp(const void *a, const void *b) {
@@ -1669,8 +1981,14 @@ static int scan_dir(const char *dir, Book *bk) {
     struct dirent *e;
     while (d && (e = readdir(d)) && n < MAXBOOKS) {
         size_t l = strlen(e->d_name);
-        int pdf = l > 4 && !strcasecmp(e->d_name + l - 4, ".pdf"), txt = l > 4 && !strcasecmp(e->d_name + l - 4, ".txt");
-        if (pdf || txt) { memset(&bk[n], 0, sizeof bk[n]); bk[n].kind = txt; bk[n++].name = strdup(e->d_name); }
+        int pdf = l > 4 && !strcasecmp(e->d_name + l - 4, ".pdf");
+        int txt = l > 4 && !strcasecmp(e->d_name + l - 4, ".txt");
+        int ep  = l > 5 && !strcasecmp(e->d_name + l - 5, ".epub");
+        if (pdf || txt || ep) {
+            memset(&bk[n], 0, sizeof bk[n]);
+            bk[n].kind = txt ? 1 : ep ? 2 : 0;
+            bk[n++].name = strdup(e->d_name);
+        }
     }
     if (d) closedir(d);
     return n;
@@ -1718,8 +2036,11 @@ int main(void) {
                     snprintf(p, sizeof p, "%s%s", dir, bk[k].name);
                     consoleClear();
                     iprintf("Building cover %d/%d\n%.31s\n", k + 1, n, bk[k].name);
-                    if (bk[k].kind) thumb_txt(&bk[k]);
-                    else if (!thumb_load(&bk[k], p)) thumb_make(&bk[k], p);
+                    if (bk[k].kind == 1) thumb_txt(&bk[k]);
+                    else if (!thumb_load(&bk[k], p)) {
+                        if (bk[k].kind == 2) thumb_epub(&bk[k], p);
+                        else thumb_make(&bk[k], p);
+                    }
                 }
             }
             draw_library(sel, dir);
@@ -1744,7 +2065,9 @@ int main(void) {
                 snprintf(p, sizeof p, "%s%s", dir, b->name);
                 int startpage = (k & KEY_B) ? 0 : b->page;
                 b->last = time(NULL);
-                if (b->kind) txt_reader(b, p, startpage); else reader(b, p, startpage);
+                if (b->kind == 2) epub_reader(b, p, startpage);
+                else if (b->kind == 1) txt_reader(b, p, startpage);
+                else reader(b, p, startpage);
                 b->last = time(NULL);
                 lib_save();
                 if (g_quit) return 0;

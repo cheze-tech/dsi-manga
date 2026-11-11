@@ -1,5 +1,5 @@
 // Host test: runs the real draw_view()/jout() code on synthetic pages.
-//   gcc -fsanitize=address,undefined -Itools/stubs -Isource -o render_test tools/render_test.c source/pdf.c tools/stubs/stubs.c
+//   gcc -fsanitize=address,undefined -Itools/stubs -Isource -o render_test tools/render_test.c source/pdf.c source/id3art.c source/epub.c tools/stubs/stubs.c
 //   (add -DJD_FORMAT=0 to test the RGB888 decoder path)   ./render_test  -> /tmp/r_view*.raw
 #define main enhanced_main
 #include "../source/enhanced.c"
