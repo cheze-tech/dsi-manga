@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <sys/stat.h>
 
 #define MAXOBJ   100000
 #define MAXPAGES 20000
@@ -268,6 +269,57 @@ static void tally(Pdf *p) {
     }
 }
 
+// ---- page-index cache ------------------------------------------------------
+// Walking the page tree costs several small reads per page, and PDFs that use
+// xref streams fall back to scanning the whole file. Repeating that on every
+// open is what makes opening a book slow, so the resulting page table is saved
+// next to the book and reused while its size and modification time match.
+// Layout: "PGI1", u32 size, u32 mtime, u32 npages, npages * PdfPage.
+
+static int idx_name(const char *path, char *out, size_t n) {
+    int l = snprintf(out, n, "%s.pgi", path);
+    return l > 0 && (size_t)l < n;
+}
+
+static int idx_load(Pdf *p, const char *path) {
+    char ip[400];
+    struct stat st;
+    if (!idx_name(path, ip, sizeof ip) || stat(path, &st) != 0) return 0;
+    FILE *f = fopen(ip, "rb");
+    if (!f) return 0;
+    char magic[4];
+    uint32_t size, mt, np;
+    int ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, "PGI1", 4) &&
+             fread(&size, 4, 1, f) == 1 && fread(&mt, 4, 1, f) == 1 &&
+             fread(&np, 4, 1, f) == 1 &&
+             size == p->size && mt == (uint32_t)st.st_mtime &&
+             np > 0 && np <= MAXPAGES;
+    PdfPage *pg = NULL;
+    if (ok) {
+        pg = malloc((size_t)np * sizeof *pg);
+        if (!pg || fread(pg, sizeof *pg, np, f) != np) { free(pg); pg = NULL; ok = 0; }
+    }
+    fclose(f);
+    if (!ok) return 0;
+    p->pages = pg; p->npages = (int)np; p->cap = (int)np;
+    return 1;
+}
+
+static void idx_save(Pdf *p, const char *path) {
+    char ip[400];
+    struct stat st;
+    if (!p->npages || !idx_name(path, ip, sizeof ip) || stat(path, &st) != 0) return;
+    FILE *f = fopen(ip, "wb");
+    if (!f) return;
+    char magic[4] = { 'P', 'G', 'I', '1' };
+    uint32_t size = p->size, mt = (uint32_t)st.st_mtime, np = (uint32_t)p->npages;
+    int ok = fwrite(magic, 1, 4, f) == 4 && fwrite(&size, 4, 1, f) == 1 &&
+             fwrite(&mt, 4, 1, f) == 1 && fwrite(&np, 4, 1, f) == 1 &&
+             fwrite(p->pages, sizeof *p->pages, np, f) == np;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) remove(ip);                 // never leave a truncated index behind
+}
+
 // ---- public ---------------------------------------------------------------
 
 int pdf_open(Pdf *p, const char *path) {
@@ -276,6 +328,7 @@ int pdf_open(Pdf *p, const char *path) {
     setvbuf(p->f, NULL, _IOFBF, 8192);
     fseek(p->f, 0, SEEK_END);
     p->size = ftell(p->f);
+    if (idx_load(p, path)) return 0;      // cached page table is still valid
 
     char tail[2049];
     uint32_t t = p->size > 2048 ? p->size - 2048 : 0;
@@ -301,6 +354,7 @@ int pdf_open(Pdf *p, const char *path) {
         }
     }
     if (!p->npages) tally(p);
+    if (p->npages) idx_save(p, path);
     return 0;
 }
 

@@ -76,11 +76,11 @@ static int g_quit;
 
 // ---- optional on-device profiler -------------------------------------------
 // Build with `make dsi PROFILE=1` for on-screen timings of the load pipeline:
-// book open, SD reads, JPEG decode, background refinement and rendering.
+// PDF page-table parse, book open, SD reads, JPEG decode, refinement, drawing.
 // Without MANGA_PROFILE every macro below compiles to nothing, so the normal
 // build has no timer reads, counters or overlay drawing at all.
 #ifdef MANGA_PROFILE
-enum { P_OPEN, P_READ, P_DECODE, P_REFINE, P_DRAW, P_COUNT };
+enum { P_PARSE, P_OPEN, P_READ, P_DECODE, P_REFINE, P_DRAW, P_COUNT };
 static u64 prof_ticks[P_COUNT];
 static int prof_started;
 static inline u32 prof_now(void) {
@@ -748,13 +748,15 @@ static unsigned prof_frames;
 static void prof_draw(void) {
     if (!scr[0]) return;
     char line[48];
-    ui_rect(scr[0], 0, 60, 168, 40, ui_col(0, 0, 0));
-    snprintf(line, sizeof line, "OPEN %5ums/DEC %5ums", (unsigned)prof_ms(P_OPEN), (unsigned)prof_ms(P_DECODE));
+    ui_rect(scr[0], 0, 60, 200, 52, ui_col(0, 0, 0));
+    snprintf(line, sizeof line, "PDF %5ums", (unsigned)prof_ms(P_PARSE));
     ui_text(scr[0], 2, 62, line, ui_col(31, 31, 31), 20);
-    snprintf(line, sizeof line, "READ %5ums/REF %6ums", (unsigned)prof_ms(P_READ), (unsigned)prof_ms(P_REFINE));
+    snprintf(line, sizeof line, "OPEN %5ums", (unsigned)prof_ms(P_OPEN));
     ui_text(scr[0], 2, 74, line, ui_col(31, 31, 31), 20);
-    snprintf(line, sizeof line, "DRAW %5ums", (unsigned)prof_ms(P_DRAW));
-    ui_text(scr[0], 2, 86, line, ui_col(31, 31, 31), 20);
+    snprintf(line, sizeof line, "DEC %5ums READ %5ums", (unsigned)prof_ms(P_DECODE), (unsigned)prof_ms(P_READ));
+    ui_text(scr[0], 2, 86, line, ui_col(31, 31, 31), 24);
+    snprintf(line, sizeof line, "REF %5ums DRAW %5ums", (unsigned)prof_ms(P_REFINE), (unsigned)prof_ms(P_DRAW));
+    ui_text(scr[0], 2, 98, line, ui_col(31, 31, 31), 24);
 }
 #endif
 
@@ -1260,9 +1262,13 @@ static void reader(Book *b, const char *path, int start) {
     Pdf pdf;
 #ifdef MANGA_PROFILE
     u32 _t_open = PROF_T();              // book open -> first page on screen
+    u32 _t_parse = _t_open;              // page-table part of it, reported separately
     int _first_draw = 1;
 #endif
     int rc = pdf_open(&pdf, path);
+#ifdef MANGA_PROFILE
+    PROF_ADD(P_PARSE, _t_parse);
+#endif
     if (rc || !pdf.npages) {
         char d[200] = "";
         if (!rc) pdf_diag(&pdf, d, sizeof d);
@@ -1277,6 +1283,7 @@ static void reader(Book *b, const char *path, int start) {
     g_curpage = page;
     int view = cfg.view, rtl = cfg.rtl, f = 1, ox = 0, oy = 0, dirty = 1, turns = 0, tx = -1, ty = -1;
     int page_changed = 0, turn_dir = 1, prefetch_pending = 1, combo_latch = 0, overlay_latch = 0;
+    int first_draw = 1;
     u32 combo_pending = 0;
     int combo_wait = 0;
     b->npages = n;
@@ -1425,7 +1432,13 @@ static void reader(Book *b, const char *path, int start) {
             trim(page - span, page + span);
             if (!cached(page)) {                               // first view of this page
                 busy();
-                load_detail(&pdf, page, bad, (!dual && was_turn) ? preview : base, g_slot, 0, NULL);
+                // Use the cheap preview for the opening frame as well as page
+                // turns: a usable page appears several times sooner, and the
+                // existing chunked upgrade sharpens it to base quality right
+                // after. The final image is unchanged.
+                load_detail(&pdf, page, bad, (!dual && (was_turn || first_draw)) ? preview : base,
+                            g_slot, 0, NULL);
+                first_draw = 0;
             }
             if (dual && page + 1 < n && !cached(page + 1)) {
                 busy();
