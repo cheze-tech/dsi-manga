@@ -1923,7 +1923,10 @@ static void epub_reader(Book *b, const char *path, int start) {
             if (!keysHeld()) {
                 for (int k = pg + 1; k < pages && k < pg + 4; k++) {
                     const EpubPage *q = epub_page(e, k);
-                    if (q && q->img >= 0 && !ec_get(ch, k)) {
+                    long sz = q && q->img >= 0 ? epub_image_size(e, q->img) : -1;
+                    // Only prefetch entries small enough to finish between frames;
+                    // a huge illustration is decoded when its page is shown.
+                    if (sz >= 0 && sz <= (192L << 10) && !ec_get(ch, k)) {
                         Img im;
                         if (!decode_epub_image(e, q->img, 256, g_slot, &im)) ec_put(ch, k, q->img, &im);
                         break;

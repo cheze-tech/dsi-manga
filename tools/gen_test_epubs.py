@@ -172,4 +172,98 @@ with zipfile.ZipFile(os.path.join(outdir, "level0.epub"), "w", compresslevel=0) 
     for name, data in files2.items():
         z.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
 
+# ---- malformed / adversarial variants -------------------------------------
+CONTAINER_MISSING = CONTAINER.replace("OEBPS/content.opf", "OEBPS/nope.opf")
+
+OPF_NO_SPINE = OPF3.replace(""" <spine>
+  <itemref idref="ch1"/><itemref idref="ch2"/>
+ </spine>
+""", "")
+
+OPF_MISSING = """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+ <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Missing</dc:title></metadata>
+ <manifest><item id="c1" href="missing.xhtml" media-type="application/xhtml+xml"/></manifest>
+ <spine><itemref idref="c1"/></spine>
+</package>
+"""
+
+build(os.path.join(outdir, "bad_opf.epub"),
+      {"META-INF/container.xml": CONTAINER_MISSING}, ["META-INF/container.xml"])
+build(os.path.join(outdir, "no_spine.epub"),
+      {"META-INF/container.xml": CONTAINER, "OEBPS/content.opf": OPF_NO_SPINE,
+       "OEBPS/nav.xhtml": NAV},
+      ["META-INF/container.xml", "OEBPS/content.opf", "OEBPS/nav.xhtml"])
+build(os.path.join(outdir, "missing.epub"),
+      {"META-INF/container.xml": CONTAINER, "OEBPS/content.opf": OPF_MISSING},
+      ["META-INF/container.xml", "OEBPS/content.opf"])
+
+good = open(os.path.join(outdir, "good.epub"), "rb").read()
+
+
+def central_patch(data, name, field, value):
+    eocd = data.rfind(b"PK\x05\x06")
+    assert eocd >= 0
+    cd_off = struct.unpack_from("<I", data, eocd + 16)[0]
+    cd_size = struct.unpack_from("<I", data, eocd + 12)[0]
+    p, end = cd_off, cd_off + cd_size
+    while p + 46 <= end and data[p:p + 4] == b"PK\x01\x02":
+        nl, el, cl = struct.unpack_from("<HHH", data, p + 28)
+        if data[p + 46:p + 46 + nl] == name:
+            struct.pack_into("<I", data, p + field, value)
+            return True
+        p += 46 + nl + el + cl
+    return False
+
+
+def local_flip(data, name, delta):
+    eocd = data.rfind(b"PK\x05\x06")
+    cd_off = struct.unpack_from("<I", data, eocd + 16)[0]
+    cd_size = struct.unpack_from("<I", data, eocd + 12)[0]
+    p, end = cd_off, cd_off + cd_size
+    while p + 46 <= end and data[p:p + 4] == b"PK\x01\x02":
+        nl, el, cl = struct.unpack_from("<HHH", data, p + 28)
+        if data[p + 46:p + 46 + nl] == name:
+            lho = struct.unpack_from("<I", data, p + 42)[0]
+            lnl, lel = struct.unpack_from("<HH", data, lho + 26)
+            data[lho + 30 + lnl + lel + delta] ^= 0xFF
+            return True
+        p += 46 + nl + el + cl
+    return False
+
+
+for name, fn in (
+    ("huge.epub", lambda d: central_patch(d, b"OEBPS/ch1.xhtml", 24, 0x7FFFFFFF)),
+    ("hugec.epub", lambda d: central_patch(d, b"OEBPS/ch1.xhtml", 20, 0x7FFFFFFF)),
+    ("corrupt.epub", lambda d: local_flip(d, b"OEBPS/ch1.xhtml", 5)),
+):
+    d = bytearray(good)
+    assert fn(d), name
+    with open(os.path.join(outdir, name), "wb") as f:
+        f.write(d)
+with open(os.path.join(outdir, "truncated.epub"), "wb") as f:
+    f.write(good[:-40])
+with open(os.path.join(outdir, "random.epub"), "wb") as f:
+    f.write(bytes((i * 37 + 11) & 0xFF for i in range(4096)))
+with open(os.path.join(outdir, "img2.png"), "wb") as f:
+    f.write(PNG)
+
+# Entries above the 2 MB parser cap but below the 8 MB ZIP cap: the extract must
+# be freed even though the parse is rejected.
+BIG = "x" * (3 << 20)
+OPF_BIG = """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+ <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Big</dc:title></metadata>
+ <manifest><item id="c1" href="big.xhtml" media-type="application/xhtml+xml"/></manifest>
+ <spine><itemref idref="c1"/></spine>
+</package>
+"""
+build(os.path.join(outdir, "bigopf.epub"),
+      {"META-INF/container.xml": CONTAINER, "OEBPS/content.opf": OPF3 + "<!--" + BIG + "-->"},
+      ["META-INF/container.xml", "OEBPS/content.opf"])
+build(os.path.join(outdir, "bigchap.epub"),
+      {"META-INF/container.xml": CONTAINER, "OEBPS/content.opf": OPF_BIG,
+       "OEBPS/big.xhtml": "<html><body><p>" + BIG + "</p></body></html>"},
+      ["META-INF/container.xml", "OEBPS/content.opf", "OEBPS/big.xhtml"])
+
 print("fixtures in", outdir)

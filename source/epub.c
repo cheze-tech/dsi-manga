@@ -476,7 +476,10 @@ static int zip_extract(Epub *e, int idx, uint8_t **out, size_t *len) {
     uint8_t lh[30];
     if (fread(lh, 1, 30, e->f) != 30 || rd32(lh) != 0x04034b50u) return -1;
     uint16_t nl = rd16(lh + 26), el = rd16(lh + 28);
-    long data = (long)z->lho + 30 + nl + el;
+    uint64_t data64 = (uint64_t)z->lho + 30 + nl + el;
+    uint64_t need = z->method == 0 ? z->usize : z->csize;
+    if (data64 > e->fsize || data64 + need > e->fsize) return -1;
+    long data = (long)data64;
     uint8_t *dst = malloc((size_t)z->usize + 1);
     if (!dst) return -1;
     if (z->method == 0) {
@@ -946,7 +949,8 @@ static int load_container(Epub *e, char *out, size_t cap) {
 static int load_opf(Epub *e, const char *path) {
     int zi = zip_find(e, path);
     uint8_t *raw = NULL; size_t n = 0;
-    if (zi < 0 || zip_extract(e, zi, &raw, &n) || n > MAXXML) return -1;
+    if (zi < 0 || zip_extract(e, zi, &raw, &n)) return -1;
+    if (n > MAXXML) { free(raw); return -1; }
     const char *xml = (const char *)raw;
     char dir[600];
     dirname_of(path, dir, sizeof dir);
@@ -973,7 +977,11 @@ static int load_opf(Epub *e, const char *path) {
             char full[700];
             resolve_path(e->dir, href, full, sizeof full);
             m->id = strdup(id); m->type = strdup(type); m->props = strdup(props); m->href = strdup(full);
-            if (!m->id || !m->type || !m->props || !m->href) break;
+            if (!m->id || !m->type || !m->props || !m->href) {
+                free(m->id); free(m->type); free(m->props); free(m->href);
+                memset(m, 0, sizeof *m);
+                break;
+            }
             m->zip = zip_find(e, full);
             if (!strncmp(type, "image/", 6) && e->nimg < MAXIMG) e->img[e->nimg++] = e->nman;
             e->nman++;
@@ -1066,11 +1074,12 @@ static int load_opf(Epub *e, const char *path) {
                     }
                 }
             }
-            free(t);
         }
+        free(t);
     }
 
     e->chtitle = calloc(MAXSPINE, sizeof *e->chtitle);
+    if (!e->chtitle) { free(raw); return -1; }
     for (int i = 0; i < e->nch; i++) {
         for (int k = 0; k < e->ntoc; k++) {
             if (e->toc[k].chapter == i) { e->chtitle[i] = strdup(e->toc[k].title); break; }
@@ -1351,9 +1360,11 @@ int epub_load_chapter(Epub *e, int ch) {
     int parsed = 0;
     if (zi >= 0) {
         uint8_t *raw = NULL; size_t n = 0;
-        if (!zip_extract(e, zi, &raw, &n) && n <= MAXXML) {
-            parse_xhtml(e, (const char *)raw, (int)n, dir);
-            parsed = 1;
+        if (!zip_extract(e, zi, &raw, &n)) {
+            if (n <= MAXXML) {
+                parse_xhtml(e, (const char *)raw, (int)n, dir);
+                parsed = 1;
+            }
             free(raw);
         }
     }
@@ -1417,6 +1428,13 @@ int epub_toc_chapter(const Epub *e, int i) {
 }
 
 int epub_image_count(const Epub *e) { return e ? e->nimg : 0; }
+
+long epub_image_size(Epub *e, int id) {
+    if (!e || id < 0 || id >= e->nimg) return -1;
+    int mi = e->img[id];
+    if (mi < 0 || mi >= e->nman || e->man[mi].zip < 0) return -1;
+    return (long)e->ent[e->man[mi].zip].usize;
+}
 
 int epub_cover(const Epub *e) {
     if (!e) return -1;

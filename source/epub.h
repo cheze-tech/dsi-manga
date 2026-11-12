@@ -47,6 +47,7 @@ const char *epub_toc_title(const Epub *e, int i);
 int   epub_toc_chapter(const Epub *e, int i);
 
 int   epub_image_count(const Epub *e);
+long  epub_image_size(Epub *e, int id);          // uncompressed entry size, or -1
 int   epub_cover(const Epub *e);                 // image id, or -1
 int   epub_first_image(Epub *e, int ch);         // first image of a chapter, or -1
 // type: 1 = baseline/progressive JPEG, 2 = PNG, 0 = unsupported.

@@ -125,6 +125,101 @@ int main(int argc, char **argv) {
         epub_close(e);
     }
 
+    // Repeated open/close and book switching: leaks/stale state show up here.
+    for (int i = 0; i < 120; i++) {
+        snprintf(p, sizeof p, "%s/good.epub", dir);
+        e = epub_open(p);
+        assert(e);
+        assert(epub_chapters(e) == 2);
+        assert(epub_load_chapter(e, 0) > 0);
+        assert(epub_cover(e) >= 0);
+        epub_close(e);
+    }
+    for (int i = 0; i < 40; i++) {
+        const char *names[] = { "good.epub", "epub2.epub" };
+        for (int k = 0; k < 2; k++) {
+            snprintf(p, sizeof p, "%s/%s", dir, names[k]);
+            e = epub_open(p);
+            assert(e);
+            assert(epub_load_chapter(e, 0) > 0);
+            epub_close(e);
+        }
+    }
+    // Malformed containers/metadata must fail cleanly.
+    const char *badfiles[] = { "bad_opf.epub", "no_spine.epub", "truncated.epub", "random.epub",
+                               "bigopf.epub" };
+    for (int i = 0; i < 5; i++) {
+        snprintf(p, sizeof p, "%s/%s", dir, badfiles[i]);
+        assert(epub_open(p) == NULL);
+    }
+    // Missing/oversized/corrupt entries must yield a message page, not a crash.
+    const char *broken[] = { "missing.epub", "huge.epub", "hugec.epub", "corrupt.epub", "bigchap.epub" };
+    for (int i = 0; i < 5; i++) {
+        snprintf(p, sizeof p, "%s/%s", dir, broken[i]);
+        e = epub_open(p);
+        assert(e);
+        assert(epub_load_chapter(e, 0) > 0);
+        assert(epub_page(e, 0) != NULL);
+        epub_close(e);
+    }
+    // Header probes on every truncated prefix must stay in bounds.
+    size_t bn = 0;
+    snprintf(jp, sizeof jp, "%s/img1.jpg", dir);
+    char *jb = slurp(jp, &bn);
+    for (size_t i = 0; i <= bn; i++) {
+        int w2 = 0, h2 = 0, g2 = 0, t2 = 0;
+        epub_image_probe((const uint8_t *)jb, i, &w2, &h2, &g2, &t2);
+    }
+    free(jb);
+    snprintf(jp, sizeof jp, "%s/img2.png", dir);
+    char *pb = slurp(jp, &bn);
+    for (size_t i = 0; i <= bn; i += 2) {
+        uint16_t *pp = NULL;
+        int pw = 0, ph = 0;
+        epub_png_decode((const uint8_t *)pb, i, 4, &pp, &pw, &ph);
+        free(pp);
+        int w2 = 0, h2 = 0, g2 = 0, t2 = 0;
+        epub_image_probe((const uint8_t *)pb, i, &w2, &h2, &g2, &t2);
+    }
+    free(pb);
+    // Deterministic mutations of a valid EPUB; every open either fails or yields
+    // a structure we can walk without OOB reads or leaks.
+    size_t gn = 0;
+    snprintf(jp, sizeof jp, "%s/good.epub", dir);
+    char *gb = slurp(jp, &gn);
+    unsigned rng = 0x12345678u;
+    for (int it = 0; it < 120; it++) {
+        char *m = malloc(gn);
+        assert(m);
+        memcpy(m, gb, gn);
+        rng = rng * 1103515245u + 12345u;
+        int flips = 1 + (int)(rng % 8);
+        for (int f = 0; f < flips; f++) {
+            rng = rng * 1103515245u + 12345u;
+            size_t off = (size_t)(rng % gn);
+            m[off] ^= (uint8_t)(1u << (rng % 8));
+        }
+        snprintf(p, sizeof p, "/tmp/epub_mut.epub");
+        FILE *mf = fopen(p, "wb");
+        assert(mf);
+        assert(fwrite(m, 1, gn, mf) == gn);
+        fclose(mf);
+        free(m);
+        e = epub_open(p);
+        if (e) {
+            int nch2 = epub_chapters(e);
+            for (int c = 0; c < nch2 && c < 2; c++) {
+                if (epub_load_chapter(e, c) > 0) {
+                    (void)epub_page(e, 0);
+                    (void)epub_text(e);
+                    (void)epub_line(e, 0);
+                }
+            }
+            epub_close(e);
+        }
+    }
+    free(gb);
+
     snprintf(p, sizeof p, "%s/bad.epub", dir);
     assert(epub_open(p) == NULL);
     assert(epub_open("/tmp/definitely-missing.epub") == NULL);

@@ -118,3 +118,4 @@ HOST TESTS (no DSi needed)
   gcc -O1 -Itools/stubs -Isource -o render_test tools/render_test.c source/pdf.c source/id3art.c source/epub.c tools/stubs/stubs.c && ./render_test
   gcc -O1 -Itools/stubs -Isource -o text_test tools/text_test.c source/pdf.c source/id3art.c source/epub.c tools/stubs/stubs.c && ./text_test
   gcc -O1 -Isource -o epub_test tools/epub_test.c source/epub.c && python3 tools/gen_test_epubs.py /tmp/epub_fixtures && ./epub_test /tmp/epub_fixtures
+  gcc -O1 -Isource -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -o epub_oom_test tools/epub_oom_test.c source/epub.c && ./epub_oom_test /tmp/epub_fixtures
